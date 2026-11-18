@@ -1,0 +1,32 @@
+{
+  "name": "@fysunlabs/aec-mcp",
+  "version": "1.0.0",
+  "description": "Open-source stdio MCP client for AEC (Agent Experience Center) kernels. Zero kernel dependency: all business ops go over a hardened HTTP transport.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "bin": {
+    "aec-mcp": "./src/cli.mjs"
+  },
+  "scripts": {
+    "start": "node src/mcp.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "zod": "3.25.76"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fysunlabs/aec-mcp.git"
+  },
+  "keywords": [
+    "mcp",
+    "aec",
+    "agent-experience-center",
+    "stdio",
+    "model-context-protocol"
+  ]
+}

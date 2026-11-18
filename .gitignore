@@ -1,0 +1,17 @@
+# build / runtime artifacts
+node_modules/
+*.log
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.DS_Store
+.aec/
+aec-out/
+
+# local identity & secrets (never commit)
+author.key
+identity.json
+sessions-index.json
+roles.sqlite
+.env
+private/

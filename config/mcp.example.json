@@ -1,0 +1,23 @@
+{
+  "_comment": "aec-mcp MCP Host 配置样例。复制相应条目到你的 mcp.json 并填入真实地址/密钥。",
+  "mcpServers": {
+    "aec": {
+      "type": "stdio",
+      "command": "aec-mcp",
+      "args": ["--profile", "run"],
+      "env": {
+        "AEC_KERNEL_URL": "https://aec-api.your-domain.example"
+      }
+    },
+    "aec-author": {
+      "type": "stdio",
+      "command": "aec-mcp",
+      "args": ["--profile", "author"],
+      "env": {
+        "AEC_KERNEL_URL": "https://aec-api.your-domain.example",
+        "AEC_AUTHOR_SECRET": "REPLACE_ME",
+        "AEC_KERNEL_ALLOWLIST": "https://aec-api.your-domain.example"
+      }
+    }
+  }
+}
