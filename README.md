@@ -108,8 +108,9 @@ aec-mcp roles profile <subject>   # 查看某个用户的资料
 
 ```bash
 # 主仓库根目录
-bash scripts/aec-mcp-subtree.sh push   # 主仓 -> aec-mcp
-bash scripts/aec-mcp-subtree.sh pull   # aec-mcp -> 主仓
+bash aec/scripts/aec-mcp-subtree.sh push   # 主仓 -> aec-mcp
+bash aec/scripts/aec-mcp-subtree.sh pull   # aec-mcp -> 主仓
+bash aec/scripts/aec-mcp-subtree.sh status # 查看同步状态
 ```
 
 详见主仓库文档 `docs/MCP_仓库与同步.md` 与 [ARCHITECTURE.md](./ARCHITECTURE.md)。
