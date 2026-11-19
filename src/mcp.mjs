@@ -4,7 +4,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
-import { join, basename, resolve } from 'node:path';
+import { join, basename, resolve, sep } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
