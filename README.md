@@ -138,8 +138,30 @@ node aec/scripts/key-admin.mjs revoke --key-id host_xxx   # 撤销（下一次�
   `!!js process.env.DSH_NODE_EXECUTABLE`（会因 `command` 缺失导致入口激活失败
   `ValidationError: expected ... command: string`）；用 `!!js process.execPath`
   或写死 node 绝对路径。
-- **Claude Desktop / Cline / WorkBuddy**：均为标准 `mcpServers` JSON；WorkBuddy
-  也可在连接器管理页添加自定义 stdio 连接器，字段同上。
+- **Claude Desktop / Cline**：均为标准 `mcpServers` JSON。
+- **WorkBuddy（5.x，尤其 ≥5.11）**：既支持上面的 `mcpServers` JSON，也必须走连接器的「信任」流程——见下方「WorkBuddy 必读」。
+
+#### WorkBuddy 必读：strict MCP config 与「信任」
+
+WorkBuddy 5.x（尤其 ≥5.11）默认启用 **strict MCP config**：会话只加载「在连接器管理页信任过」的 MCP。
+仅把 `aec` 写进 `~/.workbuddy/mcp.json`，宿主会判为 `scope=user blocked by strict MCP config` 而**完全不加载**——
+表现是「配置写了、命令行能跑通，但界面里看不到 AEC、对话里没有 `mcp__aec__*` 工具」。
+**这不是重启能解决的**：没点信任，重启客户端多少次都不会加载。
+
+正确接入步骤（缺一不可）：
+
+1. 左侧栏 **专家·技能·连接器** → 顶部 **连接器** → 右上角 **自定义连接器** → 打开 **MCP 服务管理**。
+2. 点 **添加 MCP**，把上面的 `aec` 条目粘进去并保存（该编辑器操作的就是 `~/.workbuddy/mcp.json`；
+   即使文件里已手写过 `aec`，也要在这里确认可见）。
+3. 在「我的 MCP」列表里找到 `aec`，点 **信任**，状态点由灰变绿（首次信任是一次性安全门禁）。
+4. **新建或重启会话**——只有重建会话后，受信任的 MCP 才会注入工具列表。
+
+排障（看不到 AEC 时按顺序查）：
+
+- 会话日志 `~/.workbuddy/logs/<会话>.log`：出现 `scope=user blocked by strict MCP config` 即说明未走信任流程；
+  `allServers=[...]` 里出现 `aec:connected` 才算真正加载。
+- `~/.workbuddy/logs/daemon.log`：`runtimeMcpCount` 是否包含 aec、`hasTrustedRuntimeMcpEnv` 是否为 `true`。
+- 确认已点信任并重建会话；只保存文件、只重启客户端都不够。
 
 启动期 aec-mcp 会做一次连通性自检：默认云端不可达、或自托管时 `AEC_KERNEL_URL`
 填了 README 占位样例（如 `*.example`）都会直接拒绝启动；域名合法但不可达也会
@@ -159,7 +181,13 @@ node aec/scripts/key-admin.mjs revoke --key-id host_xxx   # 撤销（下一次�
 ## 三、常见问题
 
 **装了之后在助手里看不到 AEC？**
-确认 Node 版本 ≥ 22.5、`aec-mcp` 命令可用，且 `mcp.json` 条目格式正确（使用者 profile 无需填任何地址）；改完配置后重连助手。更详细的排障记录见 AEC 主仓库的 `aec/docs/MCP_连接排障.md`。
+先确认 Node 版本 ≥ 22.5、`aec-mcp` 命令可用，且 `mcp.json` 条目格式正确（使用者 profile 无需填任何地址）。
+再按宿主分别处理：
+- **WorkBuddy**：多数情况是 strict MCP config 未信任——手写 `mcp.json` 会被 `blocked by strict MCP config` 屏蔽，重启客户端无效。
+  必须走「自定义连接器 → 添加 MCP → 信任 → 重建会话」，详见上文「WorkBuddy 必读」。
+- **其他宿主**：改完配置后重连/重启助手即可。
+
+更详细的排障记录见 AEC 主仓库的 `aec/docs/MCP_连接排障.md`。
 
 **启动/调用报"无法连接 AEC 内核（connection_refused/dns/timeout…）"？**
 这是网络层错误，不是 AEC 的缺陷：默认云端模式下先检查本机网络/DNS/代理是否可达官方云端；自托管场景再核对 `AEC_KERNEL_URL` 是否为管理员给的真实地址（不要照抄 README 样例），修正后重试即可。启动自检失败时进程会退出并给出具体类别，宿主的"连接失败即拒绝激活"语义因此生效。

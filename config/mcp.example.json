@@ -1,5 +1,5 @@
 {
-  "_comment": "aec-mcp MCP Host 配置样例（密钥模式 v2.0）。使用者（run）免配置：默认连接 AEC 官方云端；首次使用时 AI 助手会向用户要一枚 AEC 密钥（aec_key_ 开头，管理员从 AEC 服务器生成）并经 aec_setup 校验保存到本机。也可以用 env AEC_API_KEY 不经对话注入密钥。自托管/私有部署时才需要填 AEC_KERNEL_URL（占位样例值如 *.example 会被启动自检拒绝）。",
+  "_comment": "aec-mcp MCP Host 配置样例（密钥模式 v2.0）。使用者（run）免配置：默认连接 AEC 官方云端；首次使用时 AI 助手会向用户要一枚 AEC 密钥（aec_key_ 开头，管理员从 AEC 服务器生成）并经 aec_setup 校验保存到本机。也可以用 env AEC_API_KEY 不经对话注入密钥。自托管/私有部署时才需要填 AEC_KERNEL_URL（占位样例值如 *.example 会被启动自检拒绝）。WorkBuddy 5.x(≥5.11) 注意：strict MCP config 默认只加载已信任的 MCP，仅手写本文件会被判为 scope=user blocked by strict MCP config 而不加载，重启客户端无效；必须在「自定义连接器 → 添加 MCP」里添加本条目并点「信任」，再新建/重启会话才生效。",
   "mcpServers": {
     "aec": {
       "type": "stdio",
