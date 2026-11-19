@@ -26,7 +26,7 @@ MCP Host (stdio)  ──►  aec-mcp (本仓库)  ──HTTP/HTTPS──►  AEC
 | 路径 | 职责 |
 |------|------|
 | `src/mcp.mjs` | MCP server：`createMcpV2` 注册工具、`aecEdgeHandlers` 四个 op 的边端逻辑、错误指引、作者页落盘、stdio main |
-| `src/transport.mjs` | 加固的 HTTP 客户端：端点校验、机器绑定、Bearer+proof、死令牌自愈、重定向防护 |
+| `src/transport.mjs` | 加固的 HTTP 客户端：端点校验（含占位域名拒绝）、启动连通性探测、网络错误分类（`network_error`）、机器绑定、Bearer+proof、死令牌自愈（仅鉴权类四码，网络失败绝不重绑）、重定向防护 |
 | `src/identity.mjs` | 机器码采集、机器证明、identity.json 读写（机器级、0600） |
 | `src/db/roles.mjs` | 本地角色库：设备码、令牌（轮换宽限）、用户资料、角色绑定 |
 | `src/edge/` | 从主仓库提取的边端纯函数：`session.mjs`（落盘/证据）、`render.mjs`、`loop.mjs`、`runner.mjs`、`params.mjs`、`signature.mjs`、`l0.mjs`、`util.mjs`、`materialize.mjs` |

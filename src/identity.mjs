@@ -6,7 +6,8 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { requireThat } from './edge/util.mjs';
+import { homedir } from 'node:os';
+import { requireThat, warn } from './edge/util.mjs';
 
 const sha256 = value => createHash('sha256').update(String(value)).digest('hex');
 export const machineProof = (salt, machineCode) => sha256(`${salt}\n${machineCode}`);
@@ -32,6 +33,17 @@ export function machineCode() {
     'This machine exposes no stable identifier (IOPlatformUUID / machine-id / MachineGuid), so it cannot be bound. Refusing to enrol instead of issuing an unbound token.');
 }
 
+// 统一默认基础目录（identity.json / author.key / sessions-index.json / roles.sqlite 共用）：
+// AEC_IDENTITY_DIR > XDG_CONFIG_HOME > Windows %APPDATA%\aec > ~/.config/aec。
+// 与 resolveIdentityPath 的候选优先级保持一致——Windows 上 HOME 通常不存在，
+// 任何读 author.key / 会话索引的代码都不允许自己再拼 HOME||'/tmp'（曾落到 /tmp 修复）。
+export function defaultIdentityDir({ env = process.env } = {}) {
+  if (env.AEC_IDENTITY_DIR) return env.AEC_IDENTITY_DIR;
+  if (env.XDG_CONFIG_HOME) return join(env.XDG_CONFIG_HOME, 'aec');
+  if (process.platform === 'win32' && env.APPDATA) return join(env.APPDATA, 'aec');
+  return join(env.HOME || homedir(), '.config', 'aec');
+}
+
 export function resolveIdentityPath({ env = process.env, explicit = null, workspaceAecDir = null } = {}) {
   const candidates = [];
   if (explicit) candidates.push({ path: resolve(explicit), level: 'explicit' });
@@ -42,7 +54,7 @@ export function resolveIdentityPath({ env = process.env, explicit = null, worksp
   if (workspaceAecDir) candidates.push({ path: join(workspaceAecDir, 'identity.json'), level: 'workspace' });
   for (const candidate of candidates) {
     try { mkdirSync(join(candidate.path, '..'), { recursive: true, mode: 0o700 }); return candidate; }
-    catch { /* not writable → next */ }
+    catch (e) { warn(`身份目录不可用（${candidate.path}）：${e.message} —— 尝试下一个候选目录。`); }
   }
   return candidates[candidates.length - 1] || null;
 }

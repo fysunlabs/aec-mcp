@@ -25,4 +25,7 @@ export function fileAt(root, path) {
   return { path: rel, digest: hash(bytes), size: bytes.length, bytes };
 }
 export function manifest(root, path) { const { bytes, ...entry } = fileAt(root, path); return entry; }
+// 边端唯一的 stderr 告警出口：stdio 协议下 stdout 是协议通道，告警只能走 stderr。
+// 用于"静默吞掉会丢状态"的关键 catch 点（会话指针、身份目录），不用于正常缺省路径。
+export function warn(msg) { try { process.stderr.write(`[aec-mcp] ${msg}\n`); } catch { /* stderr 不可用时保持静默 */ } }
 export function publicError(e) { return { code: e.code || 'invalid_request', message: e.message, details: e.details || e.issues || {} }; }

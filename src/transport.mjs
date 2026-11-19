@@ -15,21 +15,28 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { hostname, homedir } from 'node:os';
-import { requireThat } from './edge/util.mjs';
-import { machineCode, machineProof, resolveIdentityPath, loadIdentity, saveIdentity } from './identity.mjs';
+import { requireThat, warn } from './edge/util.mjs';
+import { machineCode, machineProof, resolveIdentityPath, loadIdentity, saveIdentity, defaultIdentityDir } from './identity.mjs';
 
 const readDefaultAuthorKeyFile = () => {
-  try { return readFileSync(join(process.env.AEC_IDENTITY_DIR || join(process.env.HOME || '/tmp', '.config', 'aec'), 'author.key'), 'utf8').trim() || null; }
+  try { return readFileSync(join(defaultIdentityDir(), 'author.key'), 'utf8').trim() || null; }
   catch { return null; }
 };
 export { readDefaultAuthorKeyFile };
 
 // --- S1/S2: endpoint validation -------------------------------------------
+// RFC 2606/6761 保留 TLD 与 README 占位写法：它们永远不可达，放进配置只会把
+// "配置看起来成功、功能实际不可用"的排查成本压给用户，启动期直接拒绝。
+const PLACEHOLDER_HOST = /\.(example|invalid|test|localhost)$/i;
+const PLACEHOLDER_HINT = /your-domain|replace_me/i;
 export function validateEndpoint(endpoint, env = process.env) {
   requireThat(endpoint, 'endpoint_missing', '需要配置 AEC_KERNEL_URL');
   let url;
   try { url = new URL(endpoint); } catch { requireThat(false, 'endpoint_invalid', `AEC_KERNEL_URL 不是合法 URL：${redact(endpoint)}`); }
   requireThat(url.protocol === 'https:' || url.protocol === 'http:', 'endpoint_invalid', 'AEC_KERNEL_URL 仅支持 http/https');
+  if (PLACEHOLDER_HOST.test(url.hostname) || PLACEHOLDER_HINT.test(String(endpoint)))
+    requireThat(false, 'endpoint_placeholder',
+      `AEC_KERNEL_URL 仍是文档占位值（${url.origin}）：请填入 AEC 管理员提供的真实服务地址，不要照抄 README 样例。`);
   const loopback = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(url.hostname) || url.hostname.startsWith('100.64.');
   if (url.protocol === 'http:') {
     const allowed = env.AEC_ALLOW_INSECURE_HTTP === '1';
@@ -46,6 +53,54 @@ export function validateEndpoint(endpoint, env = process.env) {
 }
 
 function redact(s) { return String(s).replace(/(aec_host_|Bearer\s+)[^\s]+/gi, '$1***').replace(/([?&](?:token|secret|key|code)=)[^&]+/gi, '$1***'); }
+
+// --- 网络错误分类（P0：fetch failed 不得被误报为内核缺陷）------------------
+// undici 的网络失败是原生 TypeError（"fetch failed"），真正的错误码在 e.cause.code；
+// 不分类就会落进 internal_error 的"这是 AEC 缺陷"文案，把排障引向错误方向。
+const NET_CODES = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ETIMEDOUT', 'EPIPE',
+  'EHOSTUNREACH', 'ENETUNREACH', 'ECONNABORTED',
+  'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT',
+  'UND_ERR_CONNECT_FAILED',
+]);
+export function classifyNetworkError(e) {
+  const cause = e?.cause ?? e;
+  const code = String(cause?.code || '');
+  if (e?.name === 'TimeoutError' || code === 'UND_ERR_CONNECT_TIMEOUT' || code === 'UND_ERR_HEADERS_TIMEOUT'
+    || code === 'UND_ERR_BODY_TIMEOUT' || code === 'ETIMEDOUT') return { category: 'timeout', cause: code || 'TimeoutError' };
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return { category: 'dns', cause: code };
+  if (code === 'ECONNREFUSED') return { category: 'connection_refused', cause: code };
+  if (code.startsWith('CERT') || code.startsWith('ERR_TLS') || code.startsWith('SSL')
+    || /certificate|ssl|tls/i.test(String(cause?.message || ''))) return { category: 'tls', cause: code || undefined };
+  return { category: 'connection', cause: code || undefined };
+}
+export function isNetworkError(e) {
+  if (!e) return false;
+  if (e instanceof TypeError && /fetch failed/i.test(String(e.message))) return true; // undici 原生网络失败
+  if (e.name === 'TimeoutError') return true;
+  const cause = e?.cause ?? e;
+  const code = String(cause?.code || '');
+  return NET_CODES.has(code) || code.startsWith('UND_ERR');
+}
+// typed network_error：文案自带端点与失败类别（P0#6），绝不写"内核缺陷"。
+function networkFailure(url, e) {
+  const { category, cause } = classifyNetworkError(e);
+  const origin = url?.origin || '(未知端点)';
+  const msg = `无法连接 AEC 内核 ${origin}（${category}${cause ? `：${cause}` : ''}）。这不是 AEC 的缺陷，也不是调用参数写错：请检查 AEC_KERNEL_URL 是否为管理员给的真实地址、本机网络/DNS/代理是否可达，修正后重试同一调用即可。`;
+  return Object.assign(new Error(redact(msg)), { code: 'network_error', details: { endpoint: origin, category, cause_code: cause || null } });
+}
+// P1#5：启动期轻量连通性探测——任何 HTTP 响应（含 401/404/5xx）即视为可达；
+// 只有连接层失败（DNS/拒连/TLS/超时）才算不可达，让宿主的 failOnStartupError 真正生效。
+export async function probeEndpoint(url, { timeoutMs = 5000 } = {}) {
+  try {
+    await fetch(url.origin, { redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) });
+    return true;
+  } catch (e) {
+    const { category, cause } = classifyNetworkError(e);
+    requireThat(false, 'endpoint_unreachable',
+      `启动自检无法连接 AEC 内核 ${url.origin}（${category}${cause ? `：${cause}` : ''}）。请确认 AEC_KERNEL_URL 是真实地址且网络可达；如确需跳过启动自检，设置 AEC_STARTUP_PROBE=0。`);
+  }
+}
 
 // --- S5: redirect-safe fetch wrapper --------------------------------------
 async function safeFetch(url, init, timeoutMs = 30000) {
@@ -77,6 +132,9 @@ export function ensureIdentity({ profile, endpoint = null, workspaceAecDir = nul
     const body = await res.json().catch(() => ({}));
     requireThat(res.ok, body?.error?.code || 'activation_failed', body?.error?.message || `激活失败 HTTP ${res.status}`);
     return body;
+  }).catch(e => {
+    if (!isNetworkError(e)) throw e; // 激活期的连接失败同样是网络问题，不是内核缺陷
+    throw networkFailure(endpointUrl, e);
   });
   return (async () => {
     let result;
@@ -152,19 +210,23 @@ export function createRemoteKernel({ endpoint, profile = 'run', explicitIdentity
       const retriable = c => ['unauthorized', 'host_expired', 'host_inactive', 'host_fingerprint_mismatch'].includes(c);
       let id = await identity();
       let res, body;
+      // S4 边界（SECURITY.md 对齐）：只有鉴权类响应码才允许 force rebind（删本地令牌重建）。
+      // 网络类失败（连接/DNS/TLS/超时）与令牌有效性无关——用同一身份原样重试一次，
+      // 仍失败则抛 typed network_error；绝不为网络抖动销毁本机已绑定的有效身份。
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           res = await post(id, path, args);
           body = await res.json().catch(() => ({}));
           break;
         } catch (e) {
-          if (attempt === 1 || !/UND_ERR_SOCKET|fetch failed|ECONNRESET|socket hang up/i.test(String(e.cause?.code || e.message || e))) throw e;
-          id = await identity({ force: true });
+          if (!isNetworkError(e)) throw e;
+          if (attempt === 1) throw networkFailure(url, e);
         }
       }
       if (retriable(body?.error?.code)) {
         id = await identity({ force: true });
-        res = await post(id, path, args);
+        try { res = await post(id, path, args); }
+        catch (e) { if (!isNetworkError(e)) throw e; throw networkFailure(url, e); }
         body = await res.json().catch(() => ({}));
       }
       // S6: sanitize any error text before it can surface to the model.

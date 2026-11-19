@@ -2,7 +2,7 @@
 
 > 你有没有遇到过：同一类任务，这次做成了，下次换个窗口又要从头教 AI？AEC 就是把"做成过的方法"沉淀下来，下次你说一句话，它把验证过的步骤、提示词和所需资源交给你的 AI 助手，助手照着做就行。
 
-`aec-mcp` 是你电脑上安装的一个小工具，它把 AEC 接入你正在用的 AI 助手（如 WorkBuddy、Claude Desktop 等）。**你不需要懂 MCP、不需要装 AEC 服务端、也不需要管理任何数据库**——装好、填一个服务地址，就能用。
+`aec-mcp` 是你电脑上安装的一个小工具，它把 AEC 接入你正在用的 AI 助手（如 WorkBuddy、Claude Desktop 等）。**你不需要懂 MCP、不需要装 AEC 服务端、也不需要手动管理任何数据库**（本机会自动维护一个小型本地状态库，见常见问题）——装好、填一个服务地址，就能用。
 
 ---
 
@@ -41,6 +41,24 @@
 ```bash
 npm install -g @fysunlabs/aec-mcp
 ```
+
+也可以直接从 GitHub 安装（拉取完整依赖树）：
+
+```bash
+npm install -g github:fysunlabs/aec-mcp
+```
+
+**从源码安装（开发者）**：注意 npm 对**本地目录**的 `-g` 安装是软链模式，不会复制依赖——
+直接 `npm install -g D:\path\to\aec-mcp` 会安装"成功"但启动即报
+`ERR_MODULE_NOT_FOUND: Cannot find package '@modelcontextprotocol/sdk'`。正确姿势二选一：
+
+```bash
+git clone https://github.com/fysunlabs/aec-mcp && cd aec-mcp
+npm install          # ① 先在源码目录装全依赖
+npm link             # ② 再全局链接 aec-mcp 命令
+```
+
+或跳过 clone，直接用上面的 GitHub spec 安装。装完可用 `aec-mcp --help`（或直接启动）验证。
 
 ### 2. 连接你的 AI 助手
 
@@ -81,6 +99,35 @@ npm install -g @fysunlabs/aec-mcp
 }
 ```
 
+### 不同宿主的配置姿势
+
+`command` 找不到 `aec-mcp` 时（非 PATH 环境、Windows 服务、DSH 等），用 **node 绝对路径 + 入口脚本绝对路径**：
+
+```json
+{
+  "mcpServers": {
+    "aec": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["<npm 全局目录>/node_modules/@fysunlabs/aec-mcp/src/cli.mjs", "--profile", "run"],
+      "env": { "AEC_KERNEL_URL": "https://aec-api.your-domain.example" }
+    }
+  }
+}
+```
+
+- npm 全局目录可用 `npm root -g` 查询（Windows 通常在 `%APPDATA%\npm\node_modules`）。
+- **DSH**：patch loader 求值阶段宿主环境变量尚未注入，`command` 里不要写
+  `!!js process.env.DSH_NODE_EXECUTABLE`（会因 `command` 缺失导致入口激活失败
+  `ValidationError: expected ... command: string`）；用 `!!js process.execPath`
+  或写死 node 绝对路径。
+- **Claude Desktop / Cline / WorkBuddy**：均为标准 `mcpServers` JSON；WorkBuddy
+  也可在连接器管理页添加自定义 stdio 连接器，字段同上。
+
+启动期 aec-mcp 会做一次连通性自检：`AEC_KERNEL_URL` 若是 README 占位样例
+（如 `*.example`）会直接拒绝启动；域名合法但不可达也会退出并给出原因
+（可用 `AEC_STARTUP_PROBE=0` 显式跳过自检）。
+
 ### 3. 开始使用
 
 连接成功后，你**不用敲命令**，只要像平时一样对 AI 助手说话：
@@ -96,6 +143,18 @@ npm install -g @fysunlabs/aec-mcp
 
 **装了之后在助手里看不到 AEC？**
 确认 Node 版本 ≥ 22.5、`aec-mcp` 命令可用，且 `mcp.json` 里的 `AEC_KERNEL_URL` 填的是管理员给你的真实地址；改完配置后重连助手。更详细的排障记录见 AEC 主仓库的 `aec/docs/MCP_连接排障.md`。
+
+**启动/调用报"无法连接 AEC 内核（connection_refused/dns/timeout…）"？**
+这是网络层错误，不是 AEC 的缺陷：先核对 `AEC_KERNEL_URL` 是否为管理员给的真实地址（不要照抄 README 样例），再检查本机网络/DNS/代理是否可达，修正后重试即可。启动自检失败时进程会退出并给出具体类别，宿主的"连接失败即拒绝激活"语义因此生效。
+
+**npm install -g 某个本地目录后启动报 ERR_MODULE_NOT_FOUND？**
+npm 对本地目录的 `-g` 安装是软链，不会复制依赖。见上文"从源码安装"：先 `npm install` 再 `npm link`，或用 `npm install -g github:fysunlabs/aec-mcp`。
+
+**本机会产生哪些文件？**
+默认目录为 `~/.config/aec`（Windows 为 `%APPDATA%\aec`；可用 `AEC_IDENTITY_DIR` 或 `XDG_CONFIG_HOME` 覆盖）：`identity.json`（设备绑定令牌）、`roles.sqlite`（本地角色/资料库）、`sessions-index.json`（会话现场指针）、`author.key`（创作者密钥，0600）。`roles.sqlite` 由 aec-mcp 自动创建与迁移，你不需要手动管理；但排障时可以检查它，或整目录删除后重连（会重新完成设备绑定）。
+
+**启动时打印 ExperimentalWarning: SQLite 是坏事吗？**
+不是。Node 22.x 的内置 `node:sqlite` 仍标记为实验性，启动可能打印 ExperimentalWarning，不影响功能；更稳的体验可用 Node 23.4+ 或更高 LTS。
 
 **我的资料会上传到哪里？**
 你的设备标识、令牌和你填写的用户资料保存在**本机**的一个 SQLite 文件里，不会上传给服务；令牌原文只留在本机内存和本地库，服务端只存哈希。公网连接强制 HTTPS。
@@ -124,11 +183,12 @@ aec-mcp roles profile <subject>    # 查看某个用户的资料
 
 | 变量 | 用途 |
 |------|------|
-| `AEC_KERNEL_URL` | AEC 服务地址（必填） |
+| `AEC_KERNEL_URL` | AEC 服务地址（必填；占位样例值会被启动自检拒绝） |
 | `AEC_AUTHOR_SECRET` | 创作密钥（仅创作者） |
 | `AEC_IDENTITY_DIR` | 本机身份/资料存放目录 |
 | `AEC_KERNEL_ALLOWLIST` | 限制可连接的服务地址 |
 | `AEC_TRIAL_ROOT` | 创作试用时的沙箱目录 |
+| `AEC_STARTUP_PROBE` | 设为 `0` 跳过启动期连通性自检（默认开启） |
 
 ---
 

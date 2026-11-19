@@ -12,7 +12,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { randomUUID, createHash } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
+import { defaultIdentityDir } from '../identity.mjs';
 
 export const DB_SCHEMA = 'aec-mcp.roles/v1';
 export const TOKEN_GRACE_MS = 10 * 60 * 1000;
@@ -96,8 +96,9 @@ const MIGRATIONS = [
 export function resolveRolesDbPath({ env = process.env, explicit = null } = {}) {
   if (explicit) return explicit;
   if (env.AEC_MCP_ROLES_DB) return env.AEC_MCP_ROLES_DB;
-  const base = env.AEC_IDENTITY_DIR || join(homedir(), '.config', 'aec');
-  return join(base, 'roles.sqlite');
+  // 与 identity.json / author.key / sessions-index.json 同一基础目录
+  // （AEC_IDENTITY_DIR > XDG_CONFIG_HOME > win32 %APPDATA%\aec > ~/.config/aec）。
+  return join(defaultIdentityDir({ env }), 'roles.sqlite');
 }
 
 const hashToken = token => `sha256:${createHash('sha256').update(String(token)).digest('hex')}`;

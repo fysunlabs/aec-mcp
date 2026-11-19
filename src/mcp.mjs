@@ -12,23 +12,23 @@ import { z } from 'zod';
 import { hostPolicyFromEnv, detectPolicyViolation } from './edge/l0.mjs';
 import { resolveWorkspace, sweepSessions, materializeOpen, collectCloseEvidence, edgeCleanup } from './edge/session.mjs';
 import { renderClose, renderTurn, renderNoMatch } from './edge/render.mjs';
-import { publicError, requireThat } from './edge/util.mjs';
+import { publicError, requireThat, warn } from './edge/util.mjs';
 import { withFallbackNotice, LIVE_SCHEMA, SESSION_ID_RE } from './edge/materialize.mjs';
-import { createRemoteKernel, inlineExtractionFile, validateEndpoint } from './transport.mjs';
+import { createRemoteKernel, inlineExtractionFile, validateEndpoint, probeEndpoint } from './transport.mjs';
 import { resolveRolesDbPath } from './db/roles.mjs';
 import { RolesDB } from './db/roles.mjs';
-import { machineCode } from './identity.mjs';
+import { machineCode, defaultIdentityDir } from './identity.mjs';
 
 const readJson = p => { try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; } };
 // 机器级 author 密钥文件（0600，运维下发）；env 陈旧时的回退来源。
 const readDefaultAuthorKeyFile = () => {
-  try { return readFileSync(join(process.env.AEC_IDENTITY_DIR || join(process.env.HOME || '/tmp', '.config', 'aec'), 'author.key'), 'utf8').trim() || null; } catch { return null; }
+  try { return readFileSync(join(defaultIdentityDir(), 'author.key'), 'utf8').trim() || null; } catch { return null; }
 };
 
 // session → workspace 指针（机器级，§10.1 身份旁）：close/turn 只有 {op,session}，
 // 不带 workspace（§8.1）。正常情况下 MCP 进程 cwd 稳定、两边解析一致；进程换了
 // cwd 或重启后，用这份索引兜底找回现场目录。
-const SESSION_INDEX = () => join(process.env.AEC_IDENTITY_DIR || join(process.env.HOME || '/tmp', '.config', 'aec'), 'sessions-index.json');
+const SESSION_INDEX = () => join(defaultIdentityDir(), 'sessions-index.json');
 const indexGet = session => readJson(SESSION_INDEX())?.[session] ?? null;
 const indexPut = (session, workspace) => {
   try {
@@ -37,7 +37,10 @@ const indexPut = (session, workspace) => {
     const doc = readJson(p) || {};
     doc[session] = workspace;
     writeFileSync(p, JSON.stringify(doc), { mode: 0o600 });
-  } catch { /* 指针失败不阻断任务 */ }
+  } catch (e) {
+    // 指针失败不阻断任务，但必须可观测：丢指针意味着进程重启后 close/turn 找不回现场。
+    warn(`会话指针写入失败（sessions-index.json）：${e.message} —— 任务继续，进程重启后现场找回将退化为 cwd 推断。`);
+  }
 };
 const wsFor = (args) => resolveWorkspace(args.workspace ?? indexGet(args.session) ?? null);
 
@@ -251,6 +254,9 @@ export function humanError(code) {
     // 内核未分类异常（TypeError / undefined 之类）：这是 AEC 的缺陷，不是调用方的参数错。
     // 明确要求"停"——B-17 实测模型会连续换参数重试三次，每次都撞同一堵墙。
     internal_error: 'AEC 内核内部错误（是 AEC 的缺陷，不是你的参数或字段写错）：不要重试，也不要换 experience_ref / intent / 包目录再猜一次。把「刚才的操作 + 会话 id + 这条原文」原样告诉用户，并说明需要运维查看内核日志。',
+    // 网络类失败（连接/DNS/TLS/超时）有独立分类：与内核缺陷、调用参数无关，
+    // 修正网络/配置后即可重试——此前被并入 internal_error，把用户引向"查内核日志"。
+    network_error: 'AEC 内核网络不可达（连接/DNS/TLS/超时——不是 AEC 的缺陷，也不是你的参数写错）：检查 AEC_KERNEL_URL 是否为管理员给的真实地址、本机网络与代理是否可达，修正后重试同一调用即可。',
     invalid_request: 'AEC 拒绝了这次请求：按上面的原文改参数后重试一次；重复同样错误说明是内核缺陷，停下并告诉用户。',
   }[code];
 }
@@ -520,10 +526,8 @@ export async function main() {
   requireThat(endpoint, 'endpoint_missing', 'aec-mcp 是纯远程客户端：必须通过 AEC_KERNEL_URL 指向 AEC 内核服务地址。');
 
   let authorSecret = process.env.AEC_AUTHOR_SECRET ?? null;
-  if (!authorSecret) {
-    try { authorSecret = readFileSync(join(process.env.AEC_IDENTITY_DIR || join(process.env.HOME || '/tmp', '.config', 'aec'), 'author.key'), 'utf8').trim() || null; } catch { /* none */ }
-  }
-  if (profile === 'author') requireThat(authorSecret, 'author_secret_missing', '--profile author 需要 AEC_AUTHOR_SECRET 或 ~/.config/aec/author.key；未配置，进程退出，不注册工具。');
+  if (!authorSecret) authorSecret = readDefaultAuthorKeyFile();
+  if (profile === 'author') requireThat(authorSecret, 'author_secret_missing', '--profile author 需要 AEC_AUTHOR_SECRET 或 author.key 文件（见 README 的默认目录说明）；未配置，进程退出，不注册工具。');
 
   const rolesDb = new RolesDB(resolveRolesDbPath());
   const kernel = createRemoteKernel({
@@ -531,6 +535,10 @@ export async function main() {
     enrollSecret: process.env.AEC_ENROLL_SECRET ?? null,
     authorSecret,
   });
+  // 启动期连通性自检（P1）：占位域名已在 validateEndpoint 拒绝；这里补"域名合法
+  // 但不可达"——任何 HTTP 响应（含 401/404/5xx）即通过，只有连接层失败才退出，
+  // 让宿主 failOnStartupError 的语义真正落地。AEC_STARTUP_PROBE=0 可显式跳过。
+  if (process.env.AEC_STARTUP_PROBE !== '0') await probeEndpoint(validateEndpoint(endpoint));
   const server = createMcpV2(kernel, { identity: kernel.identity, profile });
   let closing;
   const close = () => closing ??= (async () => { try { await server.close(); } finally { rolesDb.close(); } })();

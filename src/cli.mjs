@@ -20,6 +20,12 @@ if (cmd === 'roles') {
   db.close();
 } else {
   // Default: launch the MCP server (pass through --profile etc.).
+  // 与 mcp.mjs 直跑入口一致：启动期失败（占位 URL / 端点不可达 / 缺密钥等）只给
+  // 一行可读错误 + code，不向宿主日志倾倒堆栈。
   const { main } = await import('./mcp.mjs');
-  await main();
+  try { await main(); }
+  catch (e) {
+    process.stderr.write(`[aec-mcp] 启动失败：${e.message}（code=${e.code || 'unknown'}）\n`);
+    process.exit(1);
+  }
 }

@@ -1,5 +1,5 @@
 {
-  "_comment": "aec-mcp MCP Host 配置样例。复制相应条目到你的 mcp.json 并填入真实地址/密钥。",
+  "_comment": "aec-mcp MCP Host 配置样例。复制相应条目到你的 mcp.json 并填入真实地址/密钥。AEC_KERNEL_URL 不要照抄样例占位值（*.example 等会被启动自检拒绝）。",
   "mcpServers": {
     "aec": {
       "type": "stdio",
@@ -18,6 +18,18 @@
         "AEC_AUTHOR_SECRET": "REPLACE_ME",
         "AEC_KERNEL_ALLOWLIST": "https://aec-api.your-domain.example"
       }
+    },
+    "_aec-abs-path-example": {
+      "_comment": "command 不在 PATH 时（Windows 服务/DSH/容器）用 node 绝对路径；npm root -g 可查全局目录（Windows 常为 %APPDATA%\\npm\\node_modules）。",
+      "type": "stdio",
+      "command": "node",
+      "args": ["C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\@fysunlabs\\aec-mcp\\src\\cli.mjs", "--profile", "run"],
+      "env": {
+        "AEC_KERNEL_URL": "https://aec-api.your-domain.example"
+      }
+    },
+    "_dsh-note": {
+      "_comment": "DSH 专用：patch loader 求值阶段宿主 env 尚未注入，command 不要用 !!js process.env.DSH_NODE_EXECUTABLE（会 command 缺失、入口激活失败）；用 !!js process.execPath 或写死 node 绝对路径。"
     }
   }
 }
