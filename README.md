@@ -107,6 +107,16 @@ AEC 用**密钥**识别用户（`aec_key_` 开头，由管理员从 AEC 服务�
 
 > 密钥也可以不经对话注入：在 `mcp.json` 的 `env` 里加 `"AEC_API_KEY": "<密钥>"`，适合脚本化部署。密钥丢失/泄露找管理员撤销并换发。
 
+**管理员侧：怎么生成密钥？** 在 AEC 服务器本机（能访问内核数据目录）执行：
+
+```bash
+node aec/scripts/key-admin.mjs create --label <用户标识> --role consumer --days 90
+node aec/scripts/key-admin.mjs list      # 查看全部密钥
+node aec/scripts/key-admin.mjs revoke --key-id host_xxx   # 撤销（下一次请求即失效）
+```
+
+密钥明文只在 create 时显示一次，服务器只存哈希；自托管公网部署需在反代白名单放行 `POST /aec/v2/keys/verify`（参见内核仓库 `deploy/nginx-aec-api-public.conf`）。
+
 ### 不同宿主的配置姿势
 
 `command` 找不到 `aec-mcp` 时（非 PATH 环境、Windows 服务、DSH 等），用 **node 绝对路径 + 入口脚本绝对路径**：
