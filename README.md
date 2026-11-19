@@ -1,32 +1,50 @@
-# aec-mcp
+# AEC · 让 AI 助手按成熟经验把事做成
 
-> 开源的 [MCP](https://modelcontextprotocol.io) 客户端，用于连接 [AEC（Agent Experience Center）](https://github.com/fysunlabs/agent-experience-center) 内核。
+> 你有没有遇到过：同一类任务，这次做成了，下次换个窗口又要从头教 AI？AEC 就是把"做成过的方法"沉淀下来，下次你说一句话，它把验证过的步骤、提示词和所需资源交给你的 AI 助手，助手照着做就行。
 
-`aec-mcp` 是一个**纯客户端**：它本身不包含 AEC 内核、不存储经验包、不访问任何模型。它只做三件事——向宿主持久暴露 MCP 工具、通过加固的 HTTP 链路把工具调用转发给远端的 AEC 内核、以及在本机维护设备码与身份资料。所有业务逻辑（匹配、渲染、判级、造包）都在你指向的 AEC 内核服务上完成。
+`aec-mcp` 是你电脑上安装的一个小工具，它把 AEC 接入你正在用的 AI 助手（如 WorkBuddy、Claude Desktop 等）。**你不需要懂 MCP、不需要装 AEC 服务端、也不需要管理任何数据库**——装好、填一个服务地址，就能用。
 
-## 特性
+---
 
-- **零内核依赖**：一个 `node` 进程 + 两个 npm 依赖即可运行，不需要 AEC 源码或数据库。
-- **两个工具 / 九个操作**：`aec`（消费：`open` / `resource` / `turn` / `close`）与 `aec_author`（创作：`open` / `learn` / `plan` / `draft` / `publish`）。
-- **设备级身份绑定**：机器码永不出本机；请求携带 `Bearer <token>` + `sha256(salt + 机器码)` 证明，服务端只存证明的哈希。复制令牌在别的机器上无效。
-- **本地角色库**：SQLite 记录设备码、令牌（含轮换宽限）、用户资料与角色绑定，可用 `aec-mcp roles` 查看。
-- **链路安全加固**：强制 HTTPS（内网可显式放行）、端点 allowlist、禁止重定向跟随（防令牌外泄）、脱敏错误、超时与死令牌自愈。
+## 一、AEC 能帮你做什么
 
-## 运行环境
+### 使用场景
 
-- Node.js **>= 22.5.0**（使用内置 `node:sqlite`，无原生编译依赖）
+- **重复劳动**：每次都要做同一类事（整理资料、抓取内容、生成报告、处理图片……），不想每次重新描述做法。
+- **一次跑通，次次复用**：把这次摸索出来的成功流程保存下来，以后一句话调出来用。
+- **借用别人的成熟经验**：直接用社区或团队里已经验证、带验收标准的经验包，而不是自己从零试错。
+- **把方法沉淀成资产**：把你擅长的某件事做成"经验包"，分享给同事或用户，还能记录谁用、用得怎么样。
 
-## 安装
+### 核心能力
+
+| 能力 | 说明 |
+|------|------|
+| **一句话匹配经验** | 你用大白话说想做什么，AEC 从经验库里挑出最合适的做法；不确定时会把候选摆给你选，不会瞎猜。 |
+| **下发可执行方案** | 匹配到经验后，给你一套完整的执行步骤、每一步的提示词、需要的素材和接口，你的 AI 助手照着执行。 |
+| **自动验收** | 任务做完后，AEC 按预设标准检查结果是否达标，并记录下来——不是"做完了就算"，而是"做对了才算"。 |
+| **创作经验包** | 把你的方法一点点教给 AEC：说清需求 → 参考相似经验 → 生成方案 → 起草 → 试用验证 → 发布。全程有一页可视化的图帮你确认。 |
+| **资源与票据按需给** | 需要用到的接口密钥、素材文件在对应步骤才提供，用完不落地，减少泄露风险。 |
+
+### 两个身份，各司其职
+
+- **使用者**（默认）：消费已有经验，把事做成。人人可用。
+- **创作者**（可选）：创作和发布经验包，给使用者提供能力。需要运维下发一个创作密钥。
+
+---
+
+## 二、快速开始
+
+### 1. 安装
+
+需要 Node.js **22.5 或更高版本**（无需编译任何原生组件）。
 
 ```bash
 npm install -g @fysunlabs/aec-mcp
-# 或在项目内
-npm install @fysunlabs/aec-mcp
 ```
 
-## 配置
+### 2. 连接你的 AI 助手
 
-`aec-mcp` 是纯远程客户端，必须通过 `AEC_KERNEL_URL` 指向一个 AEC 内核服务。把它加入你的 MCP Host 配置（以 WorkBuddy / Claude Desktop 的 `mcp.json` 为例）：
+在你的 AI 助手的 MCP 配置里（通常是 `mcp.json`）加入一项，填上 AEC 服务地址：
 
 ```json
 {
@@ -43,7 +61,9 @@ npm install @fysunlabs/aec-mcp
 }
 ```
 
-创作（造包）需要额外的密钥，单独注册一个 profile：
+> `AEC_KERNEL_URL` 由你的 AEC 服务管理员提供。第一次连接时会自动完成本机设备绑定，之后无需重复操作。完整带注释的配置样例见 [`config/mcp.example.json`](./config/mcp.example.json)。
+
+如果你是**创作者**，再加一个创作入口（需要运维下发的密钥）：
 
 ```json
 {
@@ -54,77 +74,72 @@ npm install @fysunlabs/aec-mcp
       "args": ["--profile", "author"],
       "env": {
         "AEC_KERNEL_URL": "https://aec-api.your-domain.example",
-        "AEC_AUTHOR_SECRET": "<由 AEC 内核运维下发>"
+        "AEC_AUTHOR_SECRET": "<由 AEC 运维下发>"
       }
     }
   }
 }
 ```
 
-也可先阅读 [`config/mcp.example.json`](./config/mcp.example.json) 获取带注释的完整样例。
+### 3. 开始使用
 
-### 环境变量
+连接成功后，你**不用敲命令**，只要像平时一样对 AI 助手说话：
 
-| 变量 | 必填 | 说明 |
-|------|------|------|
-| `AEC_KERNEL_URL` | 是 | AEC 内核服务地址，例如 `https://aec-api.example.com` |
-| `--profile run\|author` | 否 | `run`（默认，消费）；`author`（创作，需密钥） |
-| `AEC_AUTHOR_SECRET` | author 必填 | 创作密钥；缺省回退到 `~/.config/aec/author.key` |
-| `AEC_ENROLL_SECRET` | 否 | 首次绑定的一次性注册码（如内核要求） |
-| `AEC_KERNEL_ALLOWLIST` | 否 | 允许的端点源白名单，逗号分隔；设置后仅允许列表内源 |
-| `AEC_ALLOW_INSECURE_HTTP` | 否 | 设为 `1` 才允许非回环明文 HTTP（tailnet/本地调试） |
-| `AEC_IDENTITY_DIR` | 否 | 身份/角色库目录，默认 `~/.config/aec` |
-| `AEC_MCP_ROLES_DB` | 否 | 角色库路径，默认 `~/.config/aec/roles.sqlite` |
-| `AEC_IDENTITY` | 否 | 显式身份文件路径（CI / 多身份） |
-| `AEC_TRIAL_ROOT` | 否 | 试用沙箱根目录，默认 `~/.aec-trials` |
+- **做成一件事**：明确说"用 AEC 做 X"，把你的需求原原本本说出来。AEC 会匹配经验、给出方案，助手照着执行，最后自动验收。
+- **创作一个经验包**：说"用 AEC 创作一个经验包"，跟着助手的提示走完"说需求 → 看方案图 → 起草 → 试用 → 发布"五步。方案会以一张网页图呈现，双击即可打开确认。
 
-> 安全提示：公网部署务必使用 HTTPS。`http://` 仅在 `127.0.0.1` / `localhost` / `100.64.x.x`（tailnet）被接受；其它明文地址会直接拒绝启动，除非显式设置 `AEC_ALLOW_INSECURE_HTTP=1`。
+就这么简单：说人话，助手干活，AEC 负责"有招可使、做完验货"。
 
-## 用法
+---
 
-启动后你在宿主里看到的是工具，而不是命令。典型流程：
+## 三、常见问题
 
-1. 用户明确要求「使用 AEC」时，调用 `aec`，`op=open`，`intent` 填**用户原话**（不要改写、不要总结）。
-2. 回执给出阶段指引与「会话 ses_…」；后续用 `op=turn` / `op=resource` / `op=close`，`session` 填这个 id。
-3. 创作走 `aec_author` 五阶段：`open` → `learn` → `plan`（回执给出 HTML 一页，打开给用户确认）→ `draft` → 试用 → `publish`。图示一律用回执给的 HTML 文件展示，不要贴 mermaid 源码。
+**装了之后在助手里看不到 AEC？**
+确认 Node 版本 ≥ 22.5、`aec-mcp` 命令可用，且 `mcp.json` 里的 `AEC_KERNEL_URL` 填的是管理员给你的真实地址；改完配置后重连助手。更详细的排障记录见 AEC 主仓库的 `aec/docs/MCP_连接排障.md`。
 
-`op=close` 不需要也不接受 `acceptance` 入参；验收由内核独立判定。
+**我的资料会上传到哪里？**
+你的设备标识、令牌和你填写的用户资料保存在**本机**的一个 SQLite 文件里，不会上传给服务；令牌原文只留在本机内存和本地库，服务端只存哈希。公网连接强制 HTTPS。
 
-## 查看本地角色与设备
+**必须联网吗？**
+是的，需要一个可访问的 AEC 服务地址。本机只负责收发和展示，匹配、验收等都在服务端完成。
 
-```bash
-aec-mcp roles            # 列出 schema 版本、设备、令牌数量、用户资料
-aec-mcp roles profile <subject>   # 查看某个用户的资料
-```
+**我能改地址或密钥吗？**
+可以，改配置里的环境变量后重连即可。令牌失效（换服务、轮换、过期）时会自动重新绑定。
 
-角色库存放的是**你本机的**设备码派生标识、令牌与你填的用户资料，不会上传到内核，也不含任何密钥原文。
+**设备多了会乱吗？**
+不会。令牌和设备绑定，复制到别的机器上无效；可用 `aec-mcp roles` 查看本机设备、令牌与资料。
 
-## 与 AEC 主仓库的关系
+---
 
-本仓库由 AEC 主仓库 `agent-experience-center` 通过 **git subtree** 管理。以主仓库为开发主场时：
+## 四、命令与配置速查
 
-- 涉及 `aec-mcp` 的改动请在主仓库的 `aec-mcp/` 目录修改；
-- 提交后用主仓库的同步脚本推送到本仓库：
+日常几乎用不到命令，只有查看本机资料时会用到：
 
 ```bash
-# 主仓库根目录
-bash aec/scripts/aec-mcp-subtree.sh push   # 主仓 -> aec-mcp
-bash aec/scripts/aec-mcp-subtree.sh pull   # aec-mcp -> 主仓
-bash aec/scripts/aec-mcp-subtree.sh status # 查看同步状态
+aec-mcp roles                      # 查看本机设备、令牌数量、用户资料
+aec-mcp roles profile <subject>    # 查看某个用户的资料
 ```
 
-详见主仓库文档 `docs/MCP_仓库与同步.md` 与 [ARCHITECTURE.md](./ARCHITECTURE.md)。
+常用环境变量：
 
-## 开发
+| 变量 | 用途 |
+|------|------|
+| `AEC_KERNEL_URL` | AEC 服务地址（必填） |
+| `AEC_AUTHOR_SECRET` | 创作密钥（仅创作者） |
+| `AEC_IDENTITY_DIR` | 本机身份/资料存放目录 |
+| `AEC_KERNEL_ALLOWLIST` | 限制可连接的服务地址 |
+| `AEC_TRIAL_ROOT` | 创作试用时的沙箱目录 |
 
-```bash
-npm install
-npm test
-```
+---
 
-## 安全
+## 五、想了解更多？
 
-链路与身份的安全设计见 [SECURITY.md](./SECURITY.md)。如发现安全问题，请勿公开提交 issue，按 SECURITY.md 中的方式私下报告。
+- **能力是怎么匹配和验收的、经验包是什么**：见主仓 `aec/README.md` 与 `docs/implementation.md`。
+- **安装配置、环境变量、工具与操作名等完整技术说明**：见主仓 `aec/docs/MCP_客户端介绍.md`。
+- **工作原理与模块划分**：见 [ARCHITECTURE.md](./ARCHITECTURE.md)。
+- **链路与身份安全设计**：见 [SECURITY.md](./SECURITY.md)。
+
+如发现安全问题，请勿公开提交 issue，按 [SECURITY.md](./SECURITY.md) 中的方式私下报告。
 
 ## 许可
 
