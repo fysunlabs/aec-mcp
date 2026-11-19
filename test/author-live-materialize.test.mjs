@@ -38,9 +38,11 @@ test('materializeAuthorLive writes files and replaces message placeholder', t =>
   const sdir = join(dir, SESSION);
   for (const f of ['index.html', 'state.js', 'state.json', 'live.js', 'goal.html', 'loop.html', 'resources.html']) {
     assert.ok(statSync(join(sdir, f)).isFile(), `missing ${f}`);
-    assert.equal(statSync(join(sdir, f)).mode & 0o777, 0o600, `${f} mode 0600`);
+    // NTFS 无 POSIX 权限位：writeFileSync 的 mode 在 Windows 上不生效（观察到
+    // 0o666），mode 断言只在 POSIX 主机上有意义。
+    if (process.platform !== 'win32') assert.equal(statSync(join(sdir, f)).mode & 0o777, 0o600, `${f} mode 0600`);
   }
-  assert.equal(statSync(sdir).mode & 0o777, 0o700, 'dir mode 0700');
+  if (process.platform !== 'win32') assert.equal(statSync(sdir).mode & 0o777, 0o700, 'dir mode 0700');
   assert.deepEqual(readdirSync(sdir).filter(f => f.includes('.tmp')), [], 'no .tmp leftovers');
   assert.equal(result.message.includes('{{live_view_path}}'), false, 'placeholder replaced');
   assert.equal(result.live_view_path, path);

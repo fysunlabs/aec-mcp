@@ -1,32 +1,36 @@
 {
-  "_comment": "aec-mcp MCP Host 配置样例。复制相应条目到你的 mcp.json 并填入真实地址/密钥。AEC_KERNEL_URL 不要照抄样例占位值（*.example 等会被启动自检拒绝）。",
+  "_comment": "aec-mcp MCP Host 配置样例。使用者（run）免配置：默认连接 AEC 官方云端，首次连接自动上传机器码完成校验（设备绑定）。自托管/私有部署时才需要填 AEC_KERNEL_URL（占位样例值如 *.example 会被启动自检拒绝）。",
   "mcpServers": {
     "aec": {
       "type": "stdio",
       "command": "aec-mcp",
+      "args": ["--profile", "run"]
+    },
+    "_aec-self-hosted": {
+      "_comment": "自托管/私有部署时改用这一条：填运维提供的真实内核地址覆盖默认云端。",
+      "type": "stdio",
+      "command": "aec-mcp",
       "args": ["--profile", "run"],
       "env": {
-        "AEC_KERNEL_URL": "https://aec-api.your-domain.example"
+        "AEC_KERNEL_URL": "https://kernel.internal.example"
       }
     },
     "aec-author": {
+      "_comment": "创作者专用：创作端点仅内网可用，URL 与密钥都必须由运维提供，不会回落官方云端。",
       "type": "stdio",
       "command": "aec-mcp",
       "args": ["--profile", "author"],
       "env": {
-        "AEC_KERNEL_URL": "https://aec-api.your-domain.example",
+        "AEC_KERNEL_URL": "http://100.64.0.1:18041",
         "AEC_AUTHOR_SECRET": "REPLACE_ME",
-        "AEC_KERNEL_ALLOWLIST": "https://aec-api.your-domain.example"
+        "AEC_KERNEL_ALLOWLIST": "http://100.64.0.1:18041"
       }
     },
     "_aec-abs-path-example": {
       "_comment": "command 不在 PATH 时（Windows 服务/DSH/容器）用 node 绝对路径；npm root -g 可查全局目录（Windows 常为 %APPDATA%\\npm\\node_modules）。",
       "type": "stdio",
       "command": "node",
-      "args": ["C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\@fysunlabs\\aec-mcp\\src\\cli.mjs", "--profile", "run"],
-      "env": {
-        "AEC_KERNEL_URL": "https://aec-api.your-domain.example"
-      }
+      "args": ["C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\@fysunlabs\\aec-mcp\\src\\cli.mjs", "--profile", "run"]
     },
     "_dsh-note": {
       "_comment": "DSH 专用：patch loader 求值阶段宿主 env 尚未注入，command 不要用 !!js process.env.DSH_NODE_EXECUTABLE（会 command 缺失、入口激活失败）；用 !!js process.execPath 或写死 node 绝对路径。"

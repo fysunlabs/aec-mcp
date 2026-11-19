@@ -29,6 +29,22 @@ export { readDefaultAuthorKeyFile };
 // "配置看起来成功、功能实际不可用"的排查成本压给用户，启动期直接拒绝。
 const PLACEHOLDER_HOST = /\.(example|invalid|test|localhost)$/i;
 const PLACEHOLDER_HINT = /your-domain|replace_me/i;
+
+// 官方云端 run 端点（nginx 终止 TLS；公网仅 run 四 op + 机器绑定 + 证据上传）。
+// 使用者 profile 免配置：安装后只需完成一次机器码校验（设备绑定）即可用，
+// 自托管 / 私有部署时用 AEC_KERNEL_URL 显式覆盖。
+export const DEFAULT_KERNEL_URL = 'https://aec-api.cursor-free.site';
+
+// 端点解析：显式 env 永远优先；run profile 缺省回落官方云端；author 端点公网
+// 不可用（403），必须显式提供，绝不能静默回落——静默只会把 403 变成谜题。
+export function resolveEndpoint({ profile, env = process.env } = {}) {
+  const explicit = (env.AEC_KERNEL_URL || '').trim() || null;
+  if (explicit) return explicit;
+  if (profile === 'run') return DEFAULT_KERNEL_URL;
+  requireThat(false, 'endpoint_missing',
+    '--profile author 需要显式配置 AEC_KERNEL_URL（创作端点仅内网可用，不会回落官方云端）：请填入运维提供的内核服务地址。');
+}
+
 export function validateEndpoint(endpoint, env = process.env) {
   requireThat(endpoint, 'endpoint_missing', '需要配置 AEC_KERNEL_URL');
   let url;

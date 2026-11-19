@@ -14,7 +14,7 @@ import { resolveWorkspace, sweepSessions, materializeOpen, collectCloseEvidence,
 import { renderClose, renderTurn, renderNoMatch } from './edge/render.mjs';
 import { publicError, requireThat, warn } from './edge/util.mjs';
 import { withFallbackNotice, LIVE_SCHEMA, SESSION_ID_RE } from './edge/materialize.mjs';
-import { createRemoteKernel, inlineExtractionFile, validateEndpoint, probeEndpoint } from './transport.mjs';
+import { createRemoteKernel, inlineExtractionFile, validateEndpoint, probeEndpoint, resolveEndpoint, DEFAULT_KERNEL_URL } from './transport.mjs';
 import { resolveRolesDbPath } from './db/roles.mjs';
 import { RolesDB } from './db/roles.mjs';
 import { machineCode, defaultIdentityDir } from './identity.mjs';
@@ -522,8 +522,11 @@ export function createMcpV2(kernel, { identity = null, profile = 'run' } = {}) {
 export async function main() {
   const profile = process.argv.includes('--profile', 2) ? process.argv[process.argv.indexOf('--profile', 2) + 1] : 'run';
   requireThat(['run', 'author'].includes(profile), 'invalid_profile', `未知 profile：${profile}（可选 run/author）`);
-  const endpoint = process.env.AEC_KERNEL_URL || null;
-  requireThat(endpoint, 'endpoint_missing', 'aec-mcp 是纯远程客户端：必须通过 AEC_KERNEL_URL 指向 AEC 内核服务地址。');
+  // run profile 免配置：未设 AEC_KERNEL_URL 时回落官方云端，安装即用（首次连接
+  // 自动机器码校验/设备绑定）；author 端点公网不可用，resolveEndpoint 强制显式提供。
+  const endpoint = resolveEndpoint({ profile });
+  if (!process.env.AEC_KERNEL_URL && profile === 'run')
+    warn(`未配置 AEC_KERNEL_URL：使用官方云端 ${DEFAULT_KERNEL_URL}（自托管时设置该环境变量覆盖）。`);
 
   let authorSecret = process.env.AEC_AUTHOR_SECRET ?? null;
   if (!authorSecret) authorSecret = readDefaultAuthorKeyFile();

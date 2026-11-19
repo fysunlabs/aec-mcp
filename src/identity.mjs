@@ -12,17 +12,31 @@ import { requireThat, warn } from './edge/util.mjs';
 const sha256 = value => createHash('sha256').update(String(value)).digest('hex');
 export const machineProof = (salt, machineCode) => sha256(`${salt}\n${machineCode}`);
 
-export function machineCode() {
+// machineCode 读取本机稳定标识。win32 分支首选 reg query（最快最稳）；部分
+// Windows 主机的安全软件把 reg.exe 拉黑（黑名单），读取直接失败——此时回退
+// PowerShell 读同一个注册表值：MachineGuid 语义不变，机器码不漂移，只是换一条
+// 不经过 reg.exe 可执行文件的读取途径。两条路都断才如实拒绝（绝不发无绑定令牌）。
+// execFile/platform 可注入（测试用）；生产默认真实值。
+export function machineCode({ platform = process.platform, execFile = execFileSync } = {}) {
   const read = path => readFileSync(path, 'utf8').trim();
+  const run = (cmd, args) => {
+    try { return execFile(cmd, args, { encoding: 'utf8', timeout: 10000 }); }
+    catch { return null; }
+  };
+  const GUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
   try {
-    if (process.platform === 'darwin') {
-      const out = execFileSync('/usr/sbin/ioreg', ['-rd1', '-c', 'IOPlatformExpertDevice'], { encoding: 'utf8' });
-      const m = out.match(/"IOPlatformUUID"\s*=\s*"([^"]+)"/);
+    if (platform === 'darwin') {
+      const out = run('/usr/sbin/ioreg', ['-rd1', '-c', 'IOPlatformExpertDevice']);
+      const m = out?.match(/"IOPlatformUUID"\s*=\s*"([^"]+)"/);
       if (m) return { code: m[1], source: 'IOPlatformUUID' };
-    } else if (process.platform === 'win32') {
-      const out = execFileSync('reg', ['query', 'HKLM\\SOFTWARE\\Microsoft\\Cryptography', '/v', 'MachineGuid'], { encoding: 'utf8' });
-      const m = out.match(/MachineGuid\s+REG_SZ\s+([0-9a-fA-F-]+)/);
+    } else if (platform === 'win32') {
+      const out = run('reg', ['query', 'HKLM\\SOFTWARE\\Microsoft\\Cryptography', '/v', 'MachineGuid']);
+      const m = out?.match(/MachineGuid\s+REG_SZ\s+([0-9a-fA-F-]+)/);
       if (m) return { code: m[1], source: 'MachineGuid' };
+      const psOut = run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+        "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography').MachineGuid"]);
+      const guid = String(psOut || '').trim();
+      if (GUID_RE.test(guid)) return { code: guid, source: 'MachineGuid (powershell)' };
     } else {
       for (const path of ['/etc/machine-id', '/sys/class/dmi/id/product_uuid']) {
         try { const code = read(path); if (code) return { code, source: path }; } catch { /* next */ }

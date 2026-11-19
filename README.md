@@ -2,7 +2,7 @@
 
 > 你有没有遇到过：同一类任务，这次做成了，下次换个窗口又要从头教 AI？AEC 就是把"做成过的方法"沉淀下来，下次你说一句话，它把验证过的步骤、提示词和所需资源交给你的 AI 助手，助手照着做就行。
 
-`aec-mcp` 是你电脑上安装的一个小工具，它把 AEC 接入你正在用的 AI 助手（如 WorkBuddy、Claude Desktop 等）。**你不需要懂 MCP、不需要装 AEC 服务端、也不需要手动管理任何数据库**（本机会自动维护一个小型本地状态库，见常见问题）——装好、填一个服务地址，就能用。
+`aec-mcp` 是你电脑上安装的一个小工具，它把 AEC 接入你正在用的 AI 助手（如 WorkBuddy、Claude Desktop 等）。**你不需要懂 MCP、不需要装 AEC 服务端、也不需要手动管理任何数据库**（本机会自动维护一个小型本地状态库，见常见问题）——装好、在助手里登记一项、完成一次机器码校验，就能用。
 
 ---
 
@@ -62,7 +62,7 @@ npm link             # ② 再全局链接 aec-mcp 命令
 
 ### 2. 连接你的 AI 助手
 
-在你的 AI 助手的 MCP 配置里（通常是 `mcp.json`）加入一项，填上 AEC 服务地址：
+在你的 AI 助手的 MCP 配置里（通常是 `mcp.json`）加入一项——**无需填写任何服务地址**：
 
 ```json
 {
@@ -70,18 +70,17 @@ npm link             # ② 再全局链接 aec-mcp 命令
     "aec": {
       "type": "stdio",
       "command": "aec-mcp",
-      "args": ["--profile", "run"],
-      "env": {
-        "AEC_KERNEL_URL": "https://aec-api.your-domain.example"
-      }
+      "args": ["--profile", "run"]
     }
   }
 }
 ```
 
-> `AEC_KERNEL_URL` 由你的 AEC 服务管理员提供。第一次连接时会自动完成本机设备绑定，之后无需重复操作。完整带注释的配置样例见 [`config/mcp.example.json`](./config/mcp.example.json)。
+不填 `AEC_KERNEL_URL` 时默认连接 AEC 官方云端。第一次连接时会**自动上传本机机器码完成校验（设备绑定）**，通过后即可使用；整个过程无需找管理员要地址、无需手动注册。完整带注释的配置样例见 [`config/mcp.example.json`](./config/mcp.example.json)。
 
-如果你是**创作者**，再加一个创作入口（需要运维下发的密钥）：
+> **自托管 / 私有部署**：在 `env` 里加 `"AEC_KERNEL_URL": "<你的内核服务地址>"` 即可覆盖默认云端；占位样例值（如 `*.example`）会被启动自检拒绝。
+
+如果你是**创作者**，再加一个创作入口（创作端点仅内网可用，需要运维提供的地址与密钥）：
 
 ```json
 {
@@ -91,7 +90,7 @@ npm link             # ② 再全局链接 aec-mcp 命令
       "command": "aec-mcp",
       "args": ["--profile", "author"],
       "env": {
-        "AEC_KERNEL_URL": "https://aec-api.your-domain.example",
+        "AEC_KERNEL_URL": "<创作端点地址，仅内网可用，由运维提供>",
         "AEC_AUTHOR_SECRET": "<由 AEC 运维下发>"
       }
     }
@@ -109,8 +108,7 @@ npm link             # ② 再全局链接 aec-mcp 命令
     "aec": {
       "type": "stdio",
       "command": "node",
-      "args": ["<npm 全局目录>/node_modules/@fysunlabs/aec-mcp/src/cli.mjs", "--profile", "run"],
-      "env": { "AEC_KERNEL_URL": "https://aec-api.your-domain.example" }
+      "args": ["<npm 全局目录>/node_modules/@fysunlabs/aec-mcp/src/cli.mjs", "--profile", "run"]
     }
   }
 }
@@ -124,9 +122,9 @@ npm link             # ② 再全局链接 aec-mcp 命令
 - **Claude Desktop / Cline / WorkBuddy**：均为标准 `mcpServers` JSON；WorkBuddy
   也可在连接器管理页添加自定义 stdio 连接器，字段同上。
 
-启动期 aec-mcp 会做一次连通性自检：`AEC_KERNEL_URL` 若是 README 占位样例
-（如 `*.example`）会直接拒绝启动；域名合法但不可达也会退出并给出原因
-（可用 `AEC_STARTUP_PROBE=0` 显式跳过自检）。
+启动期 aec-mcp 会做一次连通性自检：默认云端不可达、或自托管时 `AEC_KERNEL_URL`
+填了 README 占位样例（如 `*.example`）都会直接拒绝启动；域名合法但不可达也会
+退出并给出原因（可用 `AEC_STARTUP_PROBE=0` 显式跳过自检）。
 
 ### 3. 开始使用
 
@@ -142,10 +140,13 @@ npm link             # ② 再全局链接 aec-mcp 命令
 ## 三、常见问题
 
 **装了之后在助手里看不到 AEC？**
-确认 Node 版本 ≥ 22.5、`aec-mcp` 命令可用，且 `mcp.json` 里的 `AEC_KERNEL_URL` 填的是管理员给你的真实地址；改完配置后重连助手。更详细的排障记录见 AEC 主仓库的 `aec/docs/MCP_连接排障.md`。
+确认 Node 版本 ≥ 22.5、`aec-mcp` 命令可用，且 `mcp.json` 条目格式正确（使用者 profile 无需填任何地址）；改完配置后重连助手。更详细的排障记录见 AEC 主仓库的 `aec/docs/MCP_连接排障.md`。
 
 **启动/调用报"无法连接 AEC 内核（connection_refused/dns/timeout…）"？**
-这是网络层错误，不是 AEC 的缺陷：先核对 `AEC_KERNEL_URL` 是否为管理员给的真实地址（不要照抄 README 样例），再检查本机网络/DNS/代理是否可达，修正后重试即可。启动自检失败时进程会退出并给出具体类别，宿主的"连接失败即拒绝激活"语义因此生效。
+这是网络层错误，不是 AEC 的缺陷：默认云端模式下先检查本机网络/DNS/代理是否可达官方云端；自托管场景再核对 `AEC_KERNEL_URL` 是否为管理员给的真实地址（不要照抄 README 样例），修正后重试即可。启动自检失败时进程会退出并给出具体类别，宿主的"连接失败即拒绝激活"语义因此生效。
+
+**机器码校验失败（machine_code_required）？**
+极少数主机暴露不出任何稳定硬件标识（Windows 上 MachineGuid、macOS 上 IOPlatformUUID、Linux 上 machine-id 都读不到）时会出现。Windows 上 reg.exe 被安全软件禁用时 aec-mcp 会自动改用 PowerShell 读取同一注册表值，通常无需干预；仍失败说明主机真的没有稳定标识，请换设备或联系管理员。
 
 **npm install -g 某个本地目录后启动报 ERR_MODULE_NOT_FOUND？**
 npm 对本地目录的 `-g` 安装是软链，不会复制依赖。见上文"从源码安装"：先 `npm install` 再 `npm link`，或用 `npm install -g github:fysunlabs/aec-mcp`。
@@ -183,8 +184,8 @@ aec-mcp roles profile <subject>    # 查看某个用户的资料
 
 | 变量 | 用途 |
 |------|------|
-| `AEC_KERNEL_URL` | AEC 服务地址（必填；占位样例值会被启动自检拒绝） |
-| `AEC_AUTHOR_SECRET` | 创作密钥（仅创作者） |
+| `AEC_KERNEL_URL` | AEC 服务地址（**可选**；使用者 profile 默认连官方云端，自托管/私有部署时填写。占位样例值会被启动自检拒绝） |
+| `AEC_AUTHOR_SECRET` | 创作密钥（仅创作者；此时 `AEC_KERNEL_URL` 为创作端点，必填） |
 | `AEC_IDENTITY_DIR` | 本机身份/资料存放目录 |
 | `AEC_KERNEL_ALLOWLIST` | 限制可连接的服务地址 |
 | `AEC_TRIAL_ROOT` | 创作试用时的沙箱目录 |

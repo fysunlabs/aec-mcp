@@ -1,6 +1,6 @@
 {
   "name": "@fysunlabs/aec-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Open-source stdio MCP client for AEC (Agent Experience Center) kernels. Zero kernel dependency: all business ops go over a hardened HTTP transport.",
   "type": "module",
   "license": "MIT",
