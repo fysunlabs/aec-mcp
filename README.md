@@ -163,6 +163,14 @@ WorkBuddy 5.x（尤其 ≥5.11）默认启用 **strict MCP config**：会话只�
 - `~/.workbuddy/logs/daemon.log`：`runtimeMcpCount` 是否包含 aec、`hasTrustedRuntimeMcpEnv` 是否为 `true`。
 - 确认已点信任并重建会话；只保存文件、只重启客户端都不够。
 
+**自动化 / 免点击信任（高级）**：信任状态就是 `~/.workbuddy/mcp-approvals.json` 里的一个明文条目，
+键为 `<configHash>::<server 名>`（server 名即 mcp.json 里的键，如 `aec`），值为毫秒时间戳。
+`configHash = sha256(trustMaterial)`，stdio 的 `trustMaterial = [command, args 排序后逗号连接, env 键排序后逗号连接, cwd(可选)].join('|')`。
+例如 `{type:stdio, command:aec-mcp, args:['--profile','run']}` → material `aec-mcp|--profile,run|`。
+脚本化部署可预置该条目来免去 UI 点击；注意 aec-mcp 的可执行文件/参数/env 任一变更都会改变 configHash，
+需同步更新审批键。写入后须**完全重启 WorkBuddy 进程**（信任只在启动时 `load()` 一次，无文件监听），
+重启后该服务会直接以已信任状态出现在「我的 MCP」。
+
 启动期 aec-mcp 会做一次连通性自检：默认云端不可达、或自托管时 `AEC_KERNEL_URL`
 填了 README 占位样例（如 `*.example`）都会直接拒绝启动；域名合法但不可达也会
 退出并给出原因（可用 `AEC_STARTUP_PROBE=0` 显式跳过自检）。
