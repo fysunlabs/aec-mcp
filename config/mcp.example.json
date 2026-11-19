@@ -1,5 +1,5 @@
 {
-  "_comment": "aec-mcp MCP Host 配置样例。使用者（run）免配置：默认连接 AEC 官方云端，首次连接自动上传机器码完成校验（设备绑定）。自托管/私有部署时才需要填 AEC_KERNEL_URL（占位样例值如 *.example 会被启动自检拒绝）。",
+  "_comment": "aec-mcp MCP Host 配置样例（密钥模式 v2.0）。使用者（run）免配置：默认连接 AEC 官方云端；首次使用时 AI 助手会向用户要一枚 AEC 密钥（aec_key_ 开头，管理员从 AEC 服务器生成）并经 aec_setup 校验保存到本机。也可以用 env AEC_API_KEY 不经对话注入密钥。自托管/私有部署时才需要填 AEC_KERNEL_URL（占位样例值如 *.example 会被启动自检拒绝）。",
   "mcpServers": {
     "aec": {
       "type": "stdio",
@@ -15,15 +15,22 @@
         "AEC_KERNEL_URL": "https://kernel.internal.example"
       }
     },
+    "_aec-key-injection": {
+      "_comment": "密钥不经对话注入（脚本化部署）：env AEC_API_KEY 优先于本机凭证文件。密钥由管理员从 AEC 服务器生成（aec/scripts/key-admin.mjs）。",
+      "type": "stdio",
+      "command": "aec-mcp",
+      "args": ["--profile", "run"],
+      "env": {
+        "AEC_API_KEY": "aec_key_..."
+      }
+    },
     "aec-author": {
-      "_comment": "创作者专用：创作端点仅内网可用，URL 与密钥都必须由运维提供，不会回落官方云端。",
+      "_comment": "创作者专用：创作端点仅内网可用，URL 与 publisher 密钥都由运维提供，不会回落官方云端。",
       "type": "stdio",
       "command": "aec-mcp",
       "args": ["--profile", "author"],
       "env": {
-        "AEC_KERNEL_URL": "http://100.64.0.1:18041",
-        "AEC_AUTHOR_SECRET": "REPLACE_ME",
-        "AEC_KERNEL_ALLOWLIST": "http://100.64.0.1:18041"
+        "AEC_KERNEL_URL": "http://100.64.0.1:18041"
       }
     },
     "_aec-abs-path-example": {

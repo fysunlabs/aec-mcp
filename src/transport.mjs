@@ -1,28 +1,22 @@
 // Remote kernel transport + security-hardened HTTP client.
 //
-// Every request carries Bearer <host_token> and a machine proof header.
-// The token never reaches the model and is never logged. Security invariants:
+// Every request carries Bearer <api_key>. The key never reaches the model and
+// is never logged. Security invariants:
 //   S1  endpoint scheme: HTTPS required unless AEC_ALLOW_INSECURE_HTTP=1
 //       (loopback/tailnet only). This closes the plaintext-HTTP credential leak.
 //   S2  endpoint allowlist via AEC_KERNEL_ALLOWLIST (comma-separated origins);
 //       when set, any other origin is refused before a single byte is sent.
-//   S3  bearer + machine proof on every business call; proof derived locally,
-//       machine code never transmitted.
-//   S4  dead-token self-heal: unauth/fingerprint/expired/inactive -> rebind once.
+//   S3  Bearer api_key on every business call; the key is the credential
+//       (密钥模式 2026-11-19：机器码绑定已移除——服务端逐请求查表快速校验).
+//   S4  no client-side rebind: auth failures are surfaced as typed errors with
+//       actionable guidance (the key is user-held; nothing rotates behind the
+//       user's back).
 //   S5  bounded timeouts + manual redirect handling (no auto-follow: prevents
 //       token exfiltration via 302 to an attacker origin).
-//   S6  errors are sanitized (no token / proof / secret echoed back).
+//   S6  errors are sanitized (no token / key echoed back).
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { hostname, homedir } from 'node:os';
-import { requireThat, warn } from './edge/util.mjs';
-import { machineCode, machineProof, resolveIdentityPath, loadIdentity, saveIdentity, defaultIdentityDir } from './identity.mjs';
-
-const readDefaultAuthorKeyFile = () => {
-  try { return readFileSync(join(defaultIdentityDir(), 'author.key'), 'utf8').trim() || null; }
-  catch { return null; }
-};
-export { readDefaultAuthorKeyFile };
+import { requireThat } from './edge/util.mjs';
+import { credentialsPath, loadCredentials } from './identity.mjs';
 
 // --- S1/S2: endpoint validation -------------------------------------------
 // RFC 2606/6761 保留 TLD 与 README 占位写法：它们永远不可达，放进配置只会把
@@ -30,8 +24,8 @@ export { readDefaultAuthorKeyFile };
 const PLACEHOLDER_HOST = /\.(example|invalid|test|localhost)$/i;
 const PLACEHOLDER_HINT = /your-domain|replace_me/i;
 
-// 官方云端 run 端点（nginx 终止 TLS；公网仅 run 四 op + 机器绑定 + 证据上传）。
-// 使用者 profile 免配置：安装后只需完成一次机器码校验（设备绑定）即可用，
+// 官方云端 run 端点（nginx 终止 TLS；公网仅 run 四 op + 密钥校验 + 证据上传）。
+// 使用者 profile 免配置：安装后只需一枚 api_key 即可用，
 // 自托管 / 私有部署时用 AEC_KERNEL_URL 显式覆盖。
 export const DEFAULT_KERNEL_URL = 'https://aec-api.cursor-free.site';
 
@@ -68,7 +62,7 @@ export function validateEndpoint(endpoint, env = process.env) {
   return url;
 }
 
-function redact(s) { return String(s).replace(/(aec_host_|Bearer\s+)[^\s]+/gi, '$1***').replace(/([?&](?:token|secret|key|code)=)[^&]+/gi, '$1***'); }
+function redact(s) { return String(s).replace(/(aec_host_|aec_key_|Bearer\s+)[^\s]+/gi, '$1***').replace(/([?&](?:token|secret|key|code)=)[^&]+/gi, '$1***'); }
 
 // --- 网络错误分类（P0：fetch failed 不得被误报为内核缺陷）------------------
 // undici 的网络失败是原生 TypeError（"fetch failed"），真正的错误码在 e.cause.code；
@@ -130,45 +124,41 @@ async function safeFetch(url, init, timeoutMs = 30000) {
   return res;
 }
 
-// --- identity with DB-backed device/token bookkeeping ---------------------
-export function ensureIdentity({ profile, endpoint = null, workspaceAecDir = null, explicitIdentity = null, enrollSecret = null, authorSecret = null, rolesDb = null }) {
-  const { path: identityPath, level } = resolveIdentityPath({ explicit: explicitIdentity, workspaceAecDir });
-  const doc = loadIdentity(identityPath);
-  const segment = doc?.[profile];
-  if (segment?.host_token) return Promise.resolve({ ...segment, path: identityPath, level, machine: machineCode().code, activated: false });
-  const { code: machine_code, source: machine_source } = machineCode();
-  const label = `${hostname()}#${profile}`;
-  const role = profile === 'author' ? 'publisher' : 'consumer';
-  const endpointUrl = endpoint ? validateEndpoint(endpoint) : null;
-  const activate = secret => safeFetch(new URL('/aec/v2/host/activate', endpointUrl), {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', ...(enrollSecret ? { 'x-aec-enroll-secret': enrollSecret } : {}) },
-    body: JSON.stringify({ machine_code, label: label.replace(/[^\w.-]/g, ''), role, ...(secret ? { author_secret: secret } : {}) }),
-  }, 10000).then(async res => {
-    const body = await res.json().catch(() => ({}));
-    requireThat(res.ok, body?.error?.code || 'activation_failed', body?.error?.message || `激活失败 HTTP ${res.status}`);
-    return body;
-  }).catch(e => {
-    if (!isNetworkError(e)) throw e; // 激活期的连接失败同样是网络问题，不是内核缺陷
-    throw networkFailure(endpointUrl, e);
-  });
-  return (async () => {
-    let result;
-    try { result = await activate(authorSecret); }
-    catch (e) {
-      const fileSecret = readDefaultAuthorKeyFile();
-      if (e.code !== 'author_secret_invalid' || !fileSecret || fileSecret === authorSecret) throw e;
-      result = await activate(fileSecret);
-    }
-    saveIdentity(identityPath, { endpoint, [profile]: { host_id: result.host_id, host_token: result.host_token, host_salt: result.host_salt, role: result.role, tenant: result.tenant, expires_at: result.expires_at } });
-    // Mirror into the local roles DB (device code + token + role binding).
-    if (rolesDb) {
-      const dev = rolesDb.upsertDevice({ machine_code, machine_source, label, role, endpoint, tenant: result.tenant });
-      rolesDb.putToken({ device_id: dev.device_id, token: result.host_token, host_id: result.host_id, host_salt: result.host_salt, role, endpoint, expires_at: result.expires_at });
-      rolesDb.grantRole({ subject: result.host_id || machine_code, role, endpoint, source: 'activation' });
-    }
-    return { ...result, path: identityPath, level, machine: machine_code, activated: true };
-  })();
+// --- api-key credential resolution ------------------------------------------
+// 解析顺序：env AEC_API_KEY（宿主注入，不经聊天）> 本机凭证文件对应 profile 段。
+// 都没有 → typed api_key_required（模型据此向用户要密钥，经 aec_setup 提交）。
+export const KEY_REQUIRED_MSG = 'AEC 尚未配置密钥：请向用户/管理员索取 AEC 密钥（aec_key_ 开头，从 AEC 服务器生成），然后用 aec_setup 工具提交；或者让用户把密钥填入 mcp.json 的 env AEC_API_KEY 后重连宿主。';
+export function resolveApiKey({ profile, env = process.env, credentialsFile = null } = {}) {
+  const fromEnv = (env.AEC_API_KEY || '').trim() || null;
+  if (fromEnv) return { api_key: fromEnv, source: 'env', profile };
+  const doc = loadCredentials(credentialsFile || credentialsPath({ env }));
+  const seg = doc?.[profile];
+  if (seg?.api_key) return { api_key: seg.api_key, source: 'file', key_id: seg.key_id ?? null, profile };
+  throw Object.assign(new Error(KEY_REQUIRED_MSG), { code: 'api_key_required' });
+}
+
+// 首次校验（密钥模式②）：把用户提供的 api_key 交给云端确认，成功返回元数据
+// { key_id, label, role, tenant, subject, expires_at }。密钥原文不回传。
+export async function verifyApiKey({ endpoint, api_key, timeoutMs = 10000 }) {
+  const url = validateEndpoint(endpoint);
+  requireThat(api_key && String(api_key).trim(), 'key_missing', 'api_key required');
+  let res;
+  try {
+    res = await safeFetch(new URL('/aec/v2/keys/verify', url), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ api_key: String(api_key).trim() }),
+    }, timeoutMs);
+  } catch (e) {
+    if (!isNetworkError(e)) throw e;
+    throw networkFailure(url, e);
+  }
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw Object.assign(new Error(redact(body?.error?.message || `密钥校验失败 HTTP ${res.status}`)),
+      { code: body?.error?.code || 'key_invalid', status: res.status });
+  }
+  return body;
 }
 
 // --- R5-G01: inline local extraction_file before sending ------------------
@@ -187,63 +177,41 @@ export function inlineExtractionFile(args = {}) {
 }
 
 // --- remote kernel ---------------------------------------------------------
-export function createRemoteKernel({ endpoint, profile = 'run', explicitIdentity = null, workspaceAecDir = null, enrollSecret = null, authorSecret = null, rolesDb = null }) {
+export function createRemoteKernel({ endpoint, profile = 'run', credentialsFile = null, env = process.env, rolesDb = null }) {
   const url = validateEndpoint(endpoint);
-  let cached = null;
-  const identity = async ({ force = false } = {}) => {
-    if (force) {
-      cached = null;
-      try {
-        const { path: identityPath } = resolveIdentityPath({ explicit: explicitIdentity, workspaceAecDir });
-        const doc = loadIdentity(identityPath);
-        if (doc?.[profile]?.host_token) { delete doc[profile]; saveIdentity(identityPath, doc, { replace: true }); }
-      } catch { /* 文件不存在：直接重绑 */ }
-    }
-    cached ??= await ensureIdentity({ profile, endpoint, workspaceAecDir, explicitIdentity, enrollSecret, authorSecret, rolesDb });
-    return cached;
-  };
-  // S3: proof derived per request from current identity salt + local machine code.
-  const machine = machineCode().code;
-  const post = (id, path, args) => safeFetch(new URL(path, url), {
+  const credential = () => resolveApiKey({ profile, env, credentialsFile });
+  const post = (apiKey, path, args) => safeFetch(new URL(path, url), {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      authorization: `Bearer ${id.host_token}`,
-      'x-aec-machine-proof': machineProof(id.host_salt, machine),
+      authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify(args),
   });
 
   return {
-    identity,
     endpoint: url.origin,
+    credential,
     async call(name, args) {
       const op = args.op ?? 'open';
       const isAuthor = name === 'aec_author';
       const allowed = isAuthor ? ['open', 'learn', 'plan', 'draft', 'publish'] : ['open', 'close', 'turn', 'resource'];
       requireThat(allowed.includes(op), 'invalid_op', `远程内核不支持 ${name} op=${op}`);
       const path = isAuthor ? `/aec/v2/author/${op}` : `/aec/v2/${op}`;
-      const retriable = c => ['unauthorized', 'host_expired', 'host_inactive', 'host_fingerprint_mismatch'].includes(c);
-      let id = await identity();
+      const cred = credential(); // 无密钥在这里即抛 api_key_required：业务调用之前
       let res, body;
-      // S4 边界（SECURITY.md 对齐）：只有鉴权类响应码才允许 force rebind（删本地令牌重建）。
-      // 网络类失败（连接/DNS/TLS/超时）与令牌有效性无关——用同一身份原样重试一次，
-      // 仍失败则抛 typed network_error；绝不为网络抖动销毁本机已绑定的有效身份。
+      // 网络类失败用同一凭证原样重试一次；仍失败抛 typed network_error。
+      // 鉴权失败（401/403）没有任何客户端侧重试/重绑——密钥是用户持有的，
+      // 失败原因必须如实交给模型转告用户。
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
-          res = await post(id, path, args);
+          res = await post(cred.api_key, path, args);
           body = await res.json().catch(() => ({}));
           break;
         } catch (e) {
           if (!isNetworkError(e)) throw e;
           if (attempt === 1) throw networkFailure(url, e);
         }
-      }
-      if (retriable(body?.error?.code)) {
-        id = await identity({ force: true });
-        try { res = await post(id, path, args); }
-        catch (e) { if (!isNetworkError(e)) throw e; throw networkFailure(url, e); }
-        body = await res.json().catch(() => ({}));
       }
       // S6: sanitize any error text before it can surface to the model.
       if (!res.ok) {

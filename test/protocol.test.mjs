@@ -17,7 +17,6 @@ const fakeKernel = {
     }
     return { code: 'no_match', session: null };
   },
-  async identity() { return { host_id: 'host_test' }; },
 };
 
 const server = createMcpV2(fakeKernel, { profile: 'run' });
@@ -32,6 +31,7 @@ const reg = anyServer._registeredTools || anyServer.server?._registeredTools || 
 console.log('tool names:', Object.keys(reg).join(',') || '(use protocol test instead)');
 
 if (Object.keys(reg).length) {
+  if (!reg.aec || !reg.aec_setup) { console.error('expected tools: aec + aec_setup'); process.exit(1); }
   const aecTool = reg.aec;
   const res = await aecTool.handler({ op: 'open', intent: '做一个经验包' });
   console.log('aec(open) result text head:', String(res.content?.[0]?.text || '').slice(0, 60));

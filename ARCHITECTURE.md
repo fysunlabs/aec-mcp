@@ -10,7 +10,7 @@
 MCP Host (stdio)  ──►  aec-mcp (本仓库)  ──HTTP/HTTPS──►  AEC 内核 (主仓库)
                          │                                   │
                          ├─ 工具 schema / op 路由             ├─ /aec/v2 facade
-                         ├─ 身份与机器证明                    ├─ 匹配 / 造包 / 判级
+                         ├─ 密钥凭证 (api_key)                ├─ 匹配 / 造包 / 判级
                          ├─ 边端落盘 (session/run/resources)   ├─ 能力库 / 票据
                          └─ 本地角色库 (roles.sqlite)          └─ 内核库 (state.sqlite)
 ```
@@ -25,10 +25,10 @@ MCP Host (stdio)  ──►  aec-mcp (本仓库)  ──HTTP/HTTPS──►  AEC
 
 | 路径 | 职责 |
 |------|------|
-| `src/mcp.mjs` | MCP server：`createMcpV2` 注册工具、`aecEdgeHandlers` 四个 op 的边端逻辑、错误指引、作者页落盘、stdio main |
-| `src/transport.mjs` | 加固的 HTTP 客户端：端点校验（含占位域名拒绝）、启动连通性探测、网络错误分类（`network_error`）、机器绑定、Bearer+proof、死令牌自愈（仅鉴权类四码，网络失败绝不重绑）、重定向防护 |
-| `src/identity.mjs` | 机器码采集、机器证明、identity.json 读写（机器级、0600） |
-| `src/db/roles.mjs` | 本地角色库：设备码、令牌（轮换宽限）、用户资料、角色绑定 |
+| `src/mcp.mjs` | MCP server：`createMcpV2` 注册工具（`aec` / `aec_setup` / `aec_author`）、四个 op 的边端逻辑、错误指引、作者页落盘、stdio main |
+| `src/transport.mjs` | 加固的 HTTP 客户端：端点校验（含占位域名拒绝）、默认云端端点、启动连通性探测、网络错误分类（`network_error`）、密钥解析（env > 凭证文件）、`keys/verify` 首次校验、`Bearer api_key` 业务调用、重定向防护 |
+| `src/identity.mjs` | 凭证文件读写（credentials.json，0600，win/mac/linux 目录差异） |
+| `src/db/roles.mjs` | 本地角色库：设备记录、密钥（哈希）、用户资料、角色绑定 |
 | `src/edge/` | 从主仓库提取的边端纯函数：`session.mjs`（落盘/证据）、`render.mjs`、`loop.mjs`、`runner.mjs`、`params.mjs`、`signature.mjs`、`l0.mjs`、`util.mjs`、`materialize.mjs` |
 | `src/cli.mjs` | CLI：`roles` 子命令 + 默认启动 MCP server |
 
@@ -38,16 +38,17 @@ MCP Host (stdio)  ──►  aec-mcp (本仓库)  ──HTTP/HTTPS──►  AEC
 
 需求要求角色管理数据"两端都建"，原因：
 
-- **客户端本地库**（本仓库 `roles.sqlite`）：保存设备码派生标识、令牌、用户资料、角色绑定。这些是**用户侧**数据，留在用户设备，便于离线查看、避免把个人资料上传到服务。
-- **服务端主库**（主仓库内核 `state.sqlite` 的 `hosts` 表）：保存绑定关系、令牌哈希、角色、租户、有效期。这是**鉴权权威**，客户端库只是镜像与扩展（用户资料只在客户端）。
+- **客户端本地库**（本仓库 `roles.sqlite`）：保存密钥记录（哈希）、用户资料、角色绑定。这些是**用户侧**数据，留在用户设备，便于离线查看、避免把个人资料上传到服务。
+- **服务端主库**（主仓库内核 `state.sqlite` 的 `hosts` 表）：保存密钥哈希、角色、租户、有效期。这是**鉴权权威**，客户端库只是镜像与扩展（用户资料只在客户端）。
 
-二者通过绑定流程保持一致：绑定成功后客户端把 `host_id / token / salt / role / tenant` 写入本地库；服务端在 `hosts` 表记录令牌哈希与机器证明哈希。令牌原文只出现在客户端（本地库 + 内存），服务端只存哈希。
+二者通过首次校验保持一致：`aec_setup` 校验成功后客户端把 `key_id / api_key / role / tenant` 写入凭证文件与本地库；服务端在 `hosts` 表记录密钥哈希（`fingerprint` 为 NULL 是密钥行的标记）。密钥原文只出现在客户端（凭证文件 + 内存），服务端只存哈希。
 
 ## 契约一致性
 
 工具名 / op 集合是跨仓契约，任何一侧修改都会破坏宿主：
 
 - `aec`: `open` / `resource` / `turn` / `close`
+- `aec_setup`: 密钥配置（密钥模式首次使用入口，2026-11-19 新增）
 - `aec_author`: `open` / `learn` / `plan` / `draft` / `publish`
 
-主仓库有 `console-mcp-invariance.test.mjs` 锁定该契约；本仓库的 `test/protocol.test.mjs` 做同向验证。
+主仓库有 `console-mcp-invariance.test.mjs` 锁定该契约；本仓库的 `test/protocol.test.mjs` 做同向验证。新增 `aec_setup` 是**纯增量**（宿主按需调用），不改变既有 op 契约。

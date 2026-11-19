@@ -1,9 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { validateEndpoint, inlineExtractionFile } from '../src/transport.mjs';
+import { validateEndpoint, inlineExtractionFile, resolveApiKey } from '../src/transport.mjs';
 import { RolesDB } from '../src/db/roles.mjs';
-import { machineProof } from '../src/identity.mjs';
-import { createHash } from 'node:crypto';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -36,10 +34,13 @@ test('validateEndpoint: allowlist enforced', () => {
   assert.equal(u.origin, 'https://good.com');
 });
 
-test('machineProof is sha256(salt\\ncode) and never equals raw code', () => {
-  const p = machineProof('salt123', 'machine-uuid');
-  assert.equal(p, createHash('sha256').update('salt123\nmachine-uuid').digest('hex'));
-  assert.notEqual(p.includes('machine-uuid'), true);
+test('resolveApiKey: env injection wins over credentials file; neither -> api_key_required', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aec-mcp-keyres-'));
+  const file = join(dir, 'credentials.json');
+  writeFileSync(file, JSON.stringify({ schema: 'aec.credentials/v1', endpoint: null, run: { api_key: 'aec_key_file' }, author: null }));
+  assert.equal(resolveApiKey({ profile: 'run', env: { AEC_API_KEY: 'aec_key_env' }, credentialsFile: file }).api_key, 'aec_key_env');
+  assert.equal(resolveApiKey({ profile: 'run', env: {}, credentialsFile: file }).api_key, 'aec_key_file');
+  assert.throws(() => resolveApiKey({ profile: 'run', env: {}, credentialsFile: join(dir, 'missing.json') }), e => e.code === 'api_key_required');
 });
 
 test('inlineExtractionFile converts path to candidates', () => {

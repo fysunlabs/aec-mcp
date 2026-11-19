@@ -7,23 +7,19 @@ import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync } from '
 import { join, basename, resolve, sep } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { realpathSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { z } from 'zod';
 import { hostPolicyFromEnv, detectPolicyViolation } from './edge/l0.mjs';
 import { resolveWorkspace, sweepSessions, materializeOpen, collectCloseEvidence, edgeCleanup } from './edge/session.mjs';
 import { renderClose, renderTurn, renderNoMatch } from './edge/render.mjs';
 import { publicError, requireThat, warn } from './edge/util.mjs';
 import { withFallbackNotice, LIVE_SCHEMA, SESSION_ID_RE } from './edge/materialize.mjs';
-import { createRemoteKernel, inlineExtractionFile, validateEndpoint, probeEndpoint, resolveEndpoint, DEFAULT_KERNEL_URL } from './transport.mjs';
+import { createRemoteKernel, inlineExtractionFile, validateEndpoint, probeEndpoint, resolveEndpoint, DEFAULT_KERNEL_URL, verifyApiKey } from './transport.mjs';
 import { resolveRolesDbPath } from './db/roles.mjs';
 import { RolesDB } from './db/roles.mjs';
-import { machineCode, defaultIdentityDir } from './identity.mjs';
+import { defaultIdentityDir, credentialsPath, loadCredentials, saveCredentials, detectLegacyIdentity } from './identity.mjs';
 
 const readJson = p => { try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; } };
-// 机器级 author 密钥文件（0600，运维下发）；env 陈旧时的回退来源。
-const readDefaultAuthorKeyFile = () => {
-  try { return readFileSync(join(defaultIdentityDir(), 'author.key'), 'utf8').trim() || null; } catch { return null; }
-};
 
 // session → workspace 指针（机器级，§10.1 身份旁）：close/turn 只有 {op,session}，
 // 不带 workspace（§8.1）。正常情况下 MCP 进程 cwd 稳定、两边解析一致；进程换了
@@ -46,9 +42,9 @@ const wsFor = (args) => resolveWorkspace(args.workspace ?? indexGet(args.session
 
 
 // The edge half of the aec/v2 tool. `kernel` is anything with .call(name, args).
-// `identity` (optional) binds the local kernel to a machine-level identity file:
-// remote mode binds inside createRemoteKernel instead.
-export function aecEdgeHandlers(kernel, { identity = null } = {}) {
+// 密钥模式（2026-11-19）：身份由传输层的 Bearer api_key 承载（内核从身份强制注入
+// host_id/tenant），边端不再传 host_id，也不再持有 identity 回调。
+export function aecEdgeHandlers(kernel) {
   return {
     async open(args) {
       // 试用沙箱（2026-11-09 根因③）：试用是"验证循环能不能跑通"，不是"替用户
@@ -62,13 +58,12 @@ export function aecEdgeHandlers(kernel, { identity = null } = {}) {
       const wsArg = trialRoot ?? args.workspace;
       const ws = resolveWorkspace(wsArg);
       const sweep = sweepSessions({ sessionsDir: ws.sessionsDir, ledgerPath: join(ws.aecDir, 'ledger.jsonl') });
-      const host = identity ? await identity() : null;
       // "id@version" 形式的 ref 归一化成内核要的对象；对象原样透传。
       const refArg = typeof args.experience_ref === 'string'
         ? (() => { const [id, version] = args.experience_ref.split('@'); return id && version ? { id, version } : args.experience_ref; })()
         : args.experience_ref;
       // P0-2（F2）：query 原样透传给内核（g067）；不传时不出现该键，远端 JSON 语义不变。
-      const payload = await kernel.call('aec', { op: 'open', intent: args.intent, experience_ref: refArg, trial_of: args.trial_of, ...(args.query ? { query: args.query } : {}), ...(host ? { host_id: host.host_id } : {}) });
+      const payload = await kernel.call('aec', { op: 'open', intent: args.intent, experience_ref: refArg, trial_of: args.trial_of, ...(args.query ? { query: args.query } : {}) });
       // G2 补漏：创作类意图由内核改道，不建会话、不匹配包。
       if (payload.code === 'authoring_redirect') {
         return { content: [{ type: 'text', text: payload.message }], structuredContent: payload };
@@ -243,14 +238,21 @@ export function humanError(code) {
     session_not_found: '会话不存在：重新 open。',
     session_expired: '会话过期：重新 open。',
     input_missing: '材料缺失：向用户要。',
-    unauthorized: 'AEC 通道鉴权失败（已自动重绑仍未通过，通常是多个 AEC 进程的令牌竞态）：直接重试一次同一调用即可；连续两次失败把本条原样告诉用户。',
-    host_expired: 'AEC 令牌已过期（已自动重绑仍未通过）：直接重试一次同一调用。',
-    host_inactive: 'AEC 主机已被停用：把本条原样告诉用户，需要运维恢复。',
-    host_fingerprint_mismatch: 'AEC 机器证明不符（已自动重绑仍未通过）：直接重试一次同一调用。',
-    activation_rate_limited: 'AEC 激活过于频繁：等一分钟再重试。',
+    // 密钥模式（2026-11-19）：密钥是用户持有的凭证，鉴权失败没有客户端侧自救，
+    // 全部如实转告用户，等用户换/补密钥后重试同一调用。
+    api_key_required: 'AEC 尚未配置密钥：向用户要一枚 AEC 密钥（aec_key_ 开头，由管理员从 AEC 服务器生成），拿到后用 aec_setup 工具提交；或者让用户把密钥填进 mcp.json 的 env AEC_API_KEY 后重连宿主。',
+    key_invalid: 'AEC 密钥无效（云端校验未通过）：确认密钥完整且以 aec_key_ 开头、未被撤销；请用户重新提供后用 aec_setup 再提交一次。',
+    key_revoked: 'AEC 密钥已被撤销：把本条原样告诉用户，需要管理员确认或换发一枚新的 aec_key_ 密钥（拿到后用 aec_setup 重新提交）。',
+    key_expired: 'AEC 密钥已过期：把本条原样告诉用户，需要管理员重新生成一枚 aec_key_ 密钥（拿到后用 aec_setup 重新提交）。',
+    // 旧机器绑定令牌（aec_host_ 前缀）仍存于少数宿主 env：v2.0 客户端不再支持
+    // 机器绑定，统一引导到密钥模式。
+    unauthorized: 'AEC 通道鉴权失败：若 env 里是旧机器令牌（aec_host_ 前缀），v2.0 已不再支持——请改用管理员下发的 aec_key_ 密钥（aec_setup 提交或 env AEC_API_KEY）。',
+    host_fingerprint_missing: '这个凭证是旧机器绑定令牌，v2.0 客户端已不再支持：请向管理员索取新的 aec_key_ 密钥后用 aec_setup 提交。',
+    host_expired: 'AEC 凭证已过期（旧机器绑定令牌）：请向管理员索取新的 aec_key_ 密钥。',
+    host_inactive: 'AEC 主机已被停用（旧机器绑定令牌）：请向管理员索取新的 aec_key_ 密钥。',
     session_required: '缺少会话 id：回到上一步回执取"会话 ases_…"，不要自己编一个。',
-    author_secret_invalid: 'AEC 创作密钥与内核不一致：把本条原样告诉用户，需要运维核对 AEC_AUTHOR_SECRET / ~/.config/aec/author.key 与内核 private/author.key。',
-    author_enrollment_disabled: 'AEC 内核未配置创作密钥：把本条原样告诉用户，需要运维配置 AEC_AUTHOR_SECRET_FILE。',
+    author_secret_invalid: 'AEC 创作密钥与内核不一致：把本条原样告诉用户，需要运维核对 AEC_AUTHOR_SECRET / author.key 与内核配置。',
+    author_enrollment_disabled: 'AEC 内核未配置创作密钥：把本条原样告诉用户，需要运维配置。',
     // 内核未分类异常（TypeError / undefined 之类）：这是 AEC 的缺陷，不是调用方的参数错。
     // 明确要求"停"——B-17 实测模型会连续换参数重试三次，每次都撞同一堵墙。
     internal_error: 'AEC 内核内部错误（是 AEC 的缺陷，不是你的参数或字段写错）：不要重试，也不要换 experience_ref / intent / 包目录再猜一次。把「刚才的操作 + 会话 id + 这条原文」原样告诉用户，并说明需要运维查看内核日志。',
@@ -396,12 +398,12 @@ export function errorReceipt(e) {
   return { code, text, pub: { ...pub, code } };
 }
 
-export function createMcpV2(kernel, { identity = null, profile = 'run' } = {}) {
+export function createMcpV2(kernel, { profile = 'run', endpoint = null, credentialsFile = null, env = process.env, rolesDb = null } = {}) {
   const server = new McpServer({ name: 'aec-mcp', version: '2.0.0' },
     { instructions: profile === 'author'
       ? '经验包创作。仅当用户明确要求"用 AEC 做一个经验包/技能"时调用。五阶段，内核按门推进：open（八维需求卡 + 资源需求）→ learn（本库检索，可选）→ plan（HTML 一页：三张图 + 资源表 + 判据表，必须打开给用户看并确认）→ draft（A/D 门，登记草稿）→ 试用（沙箱里跑，不是交付）→ publish（四门 + 用户明确许可）。图示一律用内核给的 HTML 文件展示，不要贴 mermaid 源码。回执第一行的阶段横幅就是当前该做什么、不许做什么。'
       : '经验包下发。仅当用户明确要求"使用/调用 AEC"时调用；其余情况不要调用。op=open 时把用户原话传给 intent。' });
-  const handlers = aecEdgeHandlers(kernel, { identity });
+  const handlers = aecEdgeHandlers(kernel);
   server.registerTool('aec', {
     description: profile === 'author'
       ? '试用草稿专用（author 工作流的第 4/5 步）。仅在 aec_author draft 返回 trial_ref 后调用：op=open 带 experience_ref 与 trial_of 跑真实试用，op=close 取得 authoritative 证据。试用产物写在独立沙箱（~/.aec-trials/…），不写用户项目；这是验证，不是给用户实施。不要用它处理普通任务——普通任务用 run profile 的 aec。'
@@ -436,6 +438,43 @@ export function createMcpV2(kernel, { identity = null, profile = 'run' } = {}) {
   }, async args => {
     try { return await handlers[args.op || 'open'](args); }
     catch (e) {
+      const receipt = errorReceipt(e);
+      return { isError: true, content: [{ type: 'text', text: receipt.text }], structuredContent: receipt.pub };
+    }
+  });
+  // aec_setup（密钥模式 2026-11-19）：首次使用的唯一入口。模型向用户要到密钥后
+  // 提交到这里：云端 keys/verify 校验 → 成功写入本机凭证文件（0600）→ 之后
+  // aec/aec_author 每次调用带 Bearer api_key 由云端快速校验。密钥原文不进回执。
+  server.registerTool('aec_setup', {
+    description: 'AEC 密钥配置（首次使用时调用）。当 aec/aec_author 报"尚未配置密钥"时：向用户要一枚 AEC 密钥（aec_key_ 开头，管理员从 AEC 服务器生成），然后调用本工具提交。校验成功后密钥保存在本机（Windows %APPDATA%\\aec / macOS·Linux ~/.config/aec，文件 0600），之后无需重复配置。',
+    inputSchema: {
+      api_key: z.string().describe('AEC 密钥原文（aec_key_ 开头），由用户从 AEC 服务器获取后提供'),
+    },
+  }, async args => {
+    try {
+      const result = await verifyApiKey({ endpoint, api_key: args.api_key });
+      const seg = {
+        api_key: String(args.api_key).trim(),
+        key_id: result.key_id ?? null, label: result.label ?? null,
+        role: result.role ?? (profile === 'author' ? 'publisher' : 'consumer'),
+        tenant: result.tenant ?? null, expires_at: result.expires_at ?? null,
+        verified_at: new Date().toISOString(),
+      };
+      const doc = saveCredentials(credentialsFile || credentialsPath({ env }), { endpoint, [profile]: seg });
+      if (rolesDb) {
+        try {
+          const dev = rolesDb.upsertDevice({ machine_code: `api-key:${result.key_id}`, machine_source: 'api_key', label: result.label || hostname(), role: seg.role, endpoint, tenant: seg.tenant });
+          rolesDb.putToken({ device_id: dev.device_id, token: seg.api_key, host_id: result.key_id, host_salt: null, role: seg.role, endpoint, expires_at: seg.expires_at });
+          rolesDb.grantRole({ subject: result.key_id || seg.api_key, role: seg.role, endpoint, source: 'api_key' });
+        } catch (e) {
+          warn(`本地角色库记录失败（不影响使用）：${e.message}`);
+        }
+      }
+      return {
+        content: [{ type: 'text', text: `[AEC] 密钥校验通过，已保存到本机凭证文件（profile=${profile}，Windows: %APPDATA%\\aec；macOS/Linux: ~/.config/aec）。\n- key_id：${result.key_id}\n- 标签：${result.label ?? '—'}\n- 角色：${result.role}\n- 租户：${result.tenant}\n- 有效期至：${result.expires_at ?? '—'}\n现在可以直接使用 aec 工具了（每次调用云端快速校验密钥）。` }],
+        structuredContent: { code: 'ready', profile, key_id: result.key_id, label: result.label, role: result.role, tenant: result.tenant, expires_at: result.expires_at, credentials_file: doc ? credentialsFile || credentialsPath({ env }) : null },
+      };
+    } catch (e) {
       const receipt = errorReceipt(e);
       return { isError: true, content: [{ type: 'text', text: receipt.text }], structuredContent: receipt.pub };
     }
@@ -522,27 +561,28 @@ export function createMcpV2(kernel, { identity = null, profile = 'run' } = {}) {
 export async function main() {
   const profile = process.argv.includes('--profile', 2) ? process.argv[process.argv.indexOf('--profile', 2) + 1] : 'run';
   requireThat(['run', 'author'].includes(profile), 'invalid_profile', `未知 profile：${profile}（可选 run/author）`);
-  // run profile 免配置：未设 AEC_KERNEL_URL 时回落官方云端，安装即用（首次连接
-  // 自动机器码校验/设备绑定）；author 端点公网不可用，resolveEndpoint 强制显式提供。
+  // run profile 免配置：未设 AEC_KERNEL_URL 时回落官方云端（首次连接自动提示）；
+  // author 端点公网不可用，resolveEndpoint 强制显式提供。
   const endpoint = resolveEndpoint({ profile });
   if (!process.env.AEC_KERNEL_URL && profile === 'run')
     warn(`未配置 AEC_KERNEL_URL：使用官方云端 ${DEFAULT_KERNEL_URL}（自托管时设置该环境变量覆盖）。`);
-
-  let authorSecret = process.env.AEC_AUTHOR_SECRET ?? null;
-  if (!authorSecret) authorSecret = readDefaultAuthorKeyFile();
-  if (profile === 'author') requireThat(authorSecret, 'author_secret_missing', '--profile author 需要 AEC_AUTHOR_SECRET 或 author.key 文件（见 README 的默认目录说明）；未配置，进程退出，不注册工具。');
+  // 密钥模式提示（不阻断启动）：宿主仍可完成 MCP 握手；首次业务调用缺密钥时
+  // 回执会指引模型向用户要密钥并经 aec_setup 提交。检测到旧机器绑定 identity.json
+  // 时提示迁移（v2.0 不再读取机器绑定令牌）。
+  try {
+    const legacy = detectLegacyIdentity(join(defaultIdentityDir(), 'identity.json'));
+    if (legacy) warn(`检测到旧版机器绑定文件 ${legacy}：v2.0 已改用密钥模式，旧文件不再读取（可删除）；请向管理员索取 aec_key_ 密钥并用 aec_setup 提交。`);
+    if (!(process.env.AEC_API_KEY || '').trim() && !loadCredentials(credentialsPath())?.[profile]?.api_key)
+      warn(`尚未配置 AEC 密钥：首次调用 aec 时会引导向用户索取密钥（aec_key_ 开头，经 aec_setup 提交），或由宿主 env AEC_API_KEY 注入。`);
+  } catch { /* 提示失败不影响启动 */ }
 
   const rolesDb = new RolesDB(resolveRolesDbPath());
-  const kernel = createRemoteKernel({
-    endpoint, profile, rolesDb,
-    enrollSecret: process.env.AEC_ENROLL_SECRET ?? null,
-    authorSecret,
-  });
+  const kernel = createRemoteKernel({ endpoint, profile, rolesDb });
   // 启动期连通性自检（P1）：占位域名已在 validateEndpoint 拒绝；这里补"域名合法
   // 但不可达"——任何 HTTP 响应（含 401/404/5xx）即通过，只有连接层失败才退出，
   // 让宿主 failOnStartupError 的语义真正落地。AEC_STARTUP_PROBE=0 可显式跳过。
   if (process.env.AEC_STARTUP_PROBE !== '0') await probeEndpoint(validateEndpoint(endpoint));
-  const server = createMcpV2(kernel, { identity: kernel.identity, profile });
+  const server = createMcpV2(kernel, { profile, endpoint, rolesDb });
   let closing;
   const close = () => closing ??= (async () => { try { await server.close(); } finally { rolesDb.close(); } })();
   for (const event of ['end', 'close']) process.stdin.once(event, () => { void close(); });

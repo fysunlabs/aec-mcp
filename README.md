@@ -2,7 +2,7 @@
 
 > 你有没有遇到过：同一类任务，这次做成了，下次换个窗口又要从头教 AI？AEC 就是把"做成过的方法"沉淀下来，下次你说一句话，它把验证过的步骤、提示词和所需资源交给你的 AI 助手，助手照着做就行。
 
-`aec-mcp` 是你电脑上安装的一个小工具，它把 AEC 接入你正在用的 AI 助手（如 WorkBuddy、Claude Desktop 等）。**你不需要懂 MCP、不需要装 AEC 服务端、也不需要手动管理任何数据库**（本机会自动维护一个小型本地状态库，见常见问题）——装好、在助手里登记一项、完成一次机器码校验，就能用。
+`aec-mcp` 是你电脑上安装的一个小工具，它把 AEC 接入你正在用的 AI 助手（如 WorkBuddy、Claude Desktop 等）。**你不需要懂 MCP、不需要装 AEC 服务端、也不需要手动管理任何数据库**（本机会自动维护一个小型本地状态库，见常见问题）——装好、在助手里登记一项、首次使用时给 AI 助手一枚密钥，就能用。
 
 ---
 
@@ -76,11 +76,11 @@ npm link             # ② 再全局链接 aec-mcp 命令
 }
 ```
 
-不填 `AEC_KERNEL_URL` 时默认连接 AEC 官方云端。第一次连接时会**自动上传本机机器码完成校验（设备绑定）**，通过后即可使用；整个过程无需找管理员要地址、无需手动注册。完整带注释的配置样例见 [`config/mcp.example.json`](./config/mcp.example.json)。
+不填 `AEC_KERNEL_URL` 时默认连接 AEC 官方云端。完整带注释的配置样例见 [`config/mcp.example.json`](./config/mcp.example.json)。
 
 > **自托管 / 私有部署**：在 `env` 里加 `"AEC_KERNEL_URL": "<你的内核服务地址>"` 即可覆盖默认云端；占位样例值（如 `*.example`）会被启动自检拒绝。
 
-如果你是**创作者**，再加一个创作入口（创作端点仅内网可用，需要运维提供的地址与密钥）：
+如果你是**创作者**，再加一个创作入口（创作端点仅内网可用，需要运维提供的地址）：
 
 ```json
 {
@@ -90,13 +90,22 @@ npm link             # ② 再全局链接 aec-mcp 命令
       "command": "aec-mcp",
       "args": ["--profile", "author"],
       "env": {
-        "AEC_KERNEL_URL": "<创作端点地址，仅内网可用，由运维提供>",
-        "AEC_AUTHOR_SECRET": "<由 AEC 运维下发>"
+        "AEC_KERNEL_URL": "<创作端点地址，仅内网可用，由运维提供>"
       }
     }
   }
 }
 ```
+
+### 3. 首次使用：给 AI 助手一枚密钥
+
+AEC 用**密钥**识别用户（`aec_key_` 开头，由管理员从 AEC 服务器生成，只显示一次）。首次使用只需三步：
+
+1. **安装配置好后，对 AI 助手说"用 AEC 做 X"**——助手会提示"AEC 尚未配置密钥"，并向你要密钥。
+2. **把管理员给你的密钥发给助手**——助手调用 `aec_setup` 提交，AEC 云端校验通过后，密钥自动保存在你本机的凭证文件里（Windows 在 `%APPDATA%\aec\credentials.json`，macOS / Linux 在 `~/.config/aec/credentials.json`，文件权限 0600）。
+3. **之后不再需要**——每次使用 AEC 时，密钥由云端逐次快速校验；到期/被撤销时助手会如实告诉你，找管理员换一枚新的即可。
+
+> 密钥也可以不经对话注入：在 `mcp.json` 的 `env` 里加 `"AEC_API_KEY": "<密钥>"`，适合脚本化部署。密钥丢失/泄露找管理员撤销并换发。
 
 ### 不同宿主的配置姿势
 
@@ -126,7 +135,7 @@ npm link             # ② 再全局链接 aec-mcp 命令
 填了 README 占位样例（如 `*.example`）都会直接拒绝启动；域名合法但不可达也会
 退出并给出原因（可用 `AEC_STARTUP_PROBE=0` 显式跳过自检）。
 
-### 3. 开始使用
+### 4. 开始使用
 
 连接成功后，你**不用敲命令**，只要像平时一样对 AI 助手说话：
 
@@ -145,29 +154,29 @@ npm link             # ② 再全局链接 aec-mcp 命令
 **启动/调用报"无法连接 AEC 内核（connection_refused/dns/timeout…）"？**
 这是网络层错误，不是 AEC 的缺陷：默认云端模式下先检查本机网络/DNS/代理是否可达官方云端；自托管场景再核对 `AEC_KERNEL_URL` 是否为管理员给的真实地址（不要照抄 README 样例），修正后重试即可。启动自检失败时进程会退出并给出具体类别，宿主的"连接失败即拒绝激活"语义因此生效。
 
-**机器码校验失败（machine_code_required）？**
-极少数主机暴露不出任何稳定硬件标识（Windows 上 MachineGuid、macOS 上 IOPlatformUUID、Linux 上 machine-id 都读不到）时会出现。Windows 上 reg.exe 被安全软件禁用时 aec-mcp 会自动改用 PowerShell 读取同一注册表值，通常无需干预；仍失败说明主机真的没有稳定标识，请换设备或联系管理员。
+**密钥从哪里来？丢了/过期了怎么办？**
+密钥由你的 AEC 管理员从 AEC 服务器生成（服务器上一条命令：`node aec/scripts/key-admin.mjs create --label <你的名字>`），通过安全渠道发给你，只显示一次。丢了或过期：找管理员撤销旧密钥、生成新密钥，重新给助手提交一次即可（旧密钥撤销后立即失效）。
+
+**助手报"尚未配置密钥 / 密钥无效 / 已撤销"？**
+尚未配置：向管理员要一枚 `aec_key_` 密钥发给助手。无效/撤销/过期：确认密钥完整（复制时别带空格换行）、未被撤销、未过期；处理后让助手重新提交。若你在 `mcp.json` 的 `env` 里放了旧版机器令牌（`aec_host_` 开头），v2.0 已不支持——请换成 `aec_key_` 密钥。
 
 **npm install -g 某个本地目录后启动报 ERR_MODULE_NOT_FOUND？**
-npm 对本地目录的 `-g` 安装是软链，不会复制依赖。见上文"从源码安装"：先 `npm install` 再 `npm link`，或用 `npm install -g github:fysunlabs/aec-mcp`。
+npm 对本地目录的 `-g` 安装是软链，不会复制依赖。见上文"从源码安装"：先 `npm install` 再 `npm link`，或用 `npm install -g git+https://github.com/fysunlabs/aec-mcp.git`。
 
 **本机会产生哪些文件？**
-默认目录为 `~/.config/aec`（Windows 为 `%APPDATA%\aec`；可用 `AEC_IDENTITY_DIR` 或 `XDG_CONFIG_HOME` 覆盖）：`identity.json`（设备绑定令牌）、`roles.sqlite`（本地角色/资料库）、`sessions-index.json`（会话现场指针）、`author.key`（创作者密钥，0600）。`roles.sqlite` 由 aec-mcp 自动创建与迁移，你不需要手动管理；但排障时可以检查它，或整目录删除后重连（会重新完成设备绑定）。
+默认目录为 `~/.config/aec`（Windows 为 `%APPDATA%\aec`；可用 `AEC_IDENTITY_DIR` 或 `XDG_CONFIG_HOME` 覆盖）：`credentials.json`（你的 AEC 密钥，0600，首次 `aec_setup` 校验成功后写入）、`roles.sqlite`（本地角色/资料库）、`sessions-index.json`（会话现场指针）。`roles.sqlite` 由 aec-mcp 自动创建与迁移，你不需要手动管理；排障时可以检查它，或整目录删除后重新提交密钥。旧版 `identity.json`（机器绑定令牌）v2.0 起不再读取，可删。
 
 **启动时打印 ExperimentalWarning: SQLite 是坏事吗？**
 不是。Node 22.x 的内置 `node:sqlite` 仍标记为实验性，启动可能打印 ExperimentalWarning，不影响功能；更稳的体验可用 Node 23.4+ 或更高 LTS。
 
 **我的资料会上传到哪里？**
-你的设备标识、令牌和你填写的用户资料保存在**本机**的一个 SQLite 文件里，不会上传给服务；令牌原文只留在本机内存和本地库，服务端只存哈希。公网连接强制 HTTPS。
+你的密钥和用户资料保存在**本机**（凭证文件 0600 + 一个 SQLite 文件）；服务端只存密钥的哈希，数据库泄露也无法还原密钥原文。每次调用只传密钥本身用于校验。公网连接强制 HTTPS。
 
 **必须联网吗？**
 是的，需要一个可访问的 AEC 服务地址。本机只负责收发和展示，匹配、验收等都在服务端完成。
 
 **我能改地址或密钥吗？**
-可以，改配置里的环境变量后重连即可。令牌失效（换服务、轮换、过期）时会自动重新绑定。
-
-**设备多了会乱吗？**
-不会。令牌和设备绑定，复制到别的机器上无效；可用 `aec-mcp roles` 查看本机设备、令牌与资料。
+可以。地址改 `mcp.json` 的 `AEC_KERNEL_URL`；密钥找管理员换发后重新给助手提交一次即可（云端校验不通过时助手会告诉你）。
 
 ---
 
@@ -185,8 +194,8 @@ aec-mcp roles profile <subject>    # 查看某个用户的资料
 | 变量 | 用途 |
 |------|------|
 | `AEC_KERNEL_URL` | AEC 服务地址（**可选**；使用者 profile 默认连官方云端，自托管/私有部署时填写。占位样例值会被启动自检拒绝） |
-| `AEC_AUTHOR_SECRET` | 创作密钥（仅创作者；此时 `AEC_KERNEL_URL` 为创作端点，必填） |
-| `AEC_IDENTITY_DIR` | 本机身份/资料存放目录 |
+| `AEC_API_KEY` | AEC 密钥（`aec_key_` 开头，可选；不经对话注入的部署方式，优先级高于本机凭证文件） |
+| `AEC_IDENTITY_DIR` | 本机凭证/资料存放目录 |
 | `AEC_KERNEL_ALLOWLIST` | 限制可连接的服务地址 |
 | `AEC_TRIAL_ROOT` | 创作试用时的沙箱目录 |
 | `AEC_STARTUP_PROBE` | 设为 `0` 跳过启动期连通性自检（默认开启） |

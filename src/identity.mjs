@@ -1,61 +1,27 @@
-// Machine-level identity primitives, extracted from AEC's hosts.mjs + config.mjs.
-// The machine code is NEVER transmitted in clear and NEVER stored server-side:
-// only proof = sha256(host_salt + machine_code) leaves this machine, and only
-// sha256(proof) is stored by the kernel. A copied token cannot work elsewhere.
-import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+// Client-side identity primitives.
+//
+// 2026-11-19 密钥模式：机器码绑定（machineCode / machineProof / 机器激活）整体
+// 移除——机器码依赖 reg query / ioreg 等平台命令，在安全软件黑名单（reg.exe 被
+// 禁）的 Windows 主机上读不到，安装链路直接断在这一步。身份从"机器自证"换成
+// "用户持票"：用户从 AEC 服务器获取 api_key（aec_key_ 前缀），客户端首次经
+// POST /aec/v2/keys/verify 云端校验，成功后把密钥存进本机凭证文件；之后每次
+// 业务调用 Bearer <api_key>，由云端逐请求快速校验（查表 + 状态/过期）。
+//
+// 凭证文件（credentials.json，0600）按 profile 分段：
+//   { schema: 'aec.credentials/v1', endpoint, run: {api_key, key_id, ...}, author: {...} }
+// 目录解析沿用 defaultIdentityDir —— 这就是 win/mac/linux 的差异处理：
+//   AEC_IDENTITY_DIR > XDG_CONFIG_HOME > win32 %APPDATA%\aec > ~/.config/aec
+// （macOS 无 APPDATA 环境变量，自然落 ~/.config/aec；Linux 同）。
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { homedir } from 'node:os';
-import { requireThat, warn } from './edge/util.mjs';
+import { warn } from './edge/util.mjs';
 
-const sha256 = value => createHash('sha256').update(String(value)).digest('hex');
-export const machineProof = (salt, machineCode) => sha256(`${salt}\n${machineCode}`);
-
-// machineCode 读取本机稳定标识。win32 分支首选 reg query（最快最稳）；部分
-// Windows 主机的安全软件把 reg.exe 拉黑（黑名单），读取直接失败——此时回退
-// PowerShell 读同一个注册表值：MachineGuid 语义不变，机器码不漂移，只是换一条
-// 不经过 reg.exe 可执行文件的读取途径。两条路都断才如实拒绝（绝不发无绑定令牌）。
-// execFile/platform 可注入（测试用）；生产默认真实值。
-export function machineCode({ platform = process.platform, execFile = execFileSync } = {}) {
-  const read = path => readFileSync(path, 'utf8').trim();
-  const run = (cmd, args) => {
-    try { return execFile(cmd, args, { encoding: 'utf8', timeout: 10000 }); }
-    catch { return null; }
-  };
-  const GUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
-  try {
-    if (platform === 'darwin') {
-      const out = run('/usr/sbin/ioreg', ['-rd1', '-c', 'IOPlatformExpertDevice']);
-      const m = out?.match(/"IOPlatformUUID"\s*=\s*"([^"]+)"/);
-      if (m) return { code: m[1], source: 'IOPlatformUUID' };
-    } else if (platform === 'win32') {
-      const out = run('reg', ['query', 'HKLM\\SOFTWARE\\Microsoft\\Cryptography', '/v', 'MachineGuid']);
-      const m = out?.match(/MachineGuid\s+REG_SZ\s+([0-9a-fA-F-]+)/);
-      if (m) return { code: m[1], source: 'MachineGuid' };
-      const psOut = run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-        "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography').MachineGuid"]);
-      const guid = String(psOut || '').trim();
-      if (GUID_RE.test(guid)) return { code: guid, source: 'MachineGuid (powershell)' };
-    } else {
-      for (const path of ['/etc/machine-id', '/sys/class/dmi/id/product_uuid']) {
-        try { const code = read(path); if (code) return { code, source: path }; } catch { /* next */ }
-      }
-    }
-  } catch { /* fall through to refusal */ }
-  requireThat(false, 'machine_code_required',
-    'This machine exposes no stable identifier (IOPlatformUUID / machine-id / MachineGuid), so it cannot be bound. Refusing to enrol instead of issuing an unbound token.');
-}
-
-// 统一默认基础目录（identity.json / author.key / sessions-index.json / roles.sqlite 共用）：
-// AEC_IDENTITY_DIR > XDG_CONFIG_HOME > Windows %APPDATA%\aec > ~/.config/aec。
-// 与 resolveIdentityPath 的候选优先级保持一致——Windows 上 HOME 通常不存在，
-// 任何读 author.key / 会话索引的代码都不允许自己再拼 HOME||'/tmp'（曾落到 /tmp 修复）。
+// 统一默认基础目录（credentials.json / author.key / sessions-index.json / roles.sqlite 共用）。
 export function defaultIdentityDir({ env = process.env } = {}) {
   if (env.AEC_IDENTITY_DIR) return env.AEC_IDENTITY_DIR;
   if (env.XDG_CONFIG_HOME) return join(env.XDG_CONFIG_HOME, 'aec');
   if (process.platform === 'win32' && env.APPDATA) return join(env.APPDATA, 'aec');
-  return join(env.HOME || homedir(), '.config', 'aec');
+  return join(env.HOME || process.env.USERPROFILE, '.config', 'aec');
 }
 
 export function resolveIdentityPath({ env = process.env, explicit = null, workspaceAecDir = null } = {}) {
@@ -73,17 +39,33 @@ export function resolveIdentityPath({ env = process.env, explicit = null, worksp
   return candidates[candidates.length - 1] || null;
 }
 
-export function loadIdentity(path) {
+// --- api-key credentials file ------------------------------------------------
+export const credentialsPath = ({ env = process.env } = {}) => join(defaultIdentityDir({ env }), 'credentials.json');
+
+export function loadCredentials(path = credentialsPath()) {
   try {
     const doc = JSON.parse(readFileSync(path, 'utf8'));
-    return doc?.schema === 'aec.identity/v2' ? doc : null;
+    return doc?.schema === 'aec.credentials/v1' ? doc : null;
   } catch { return null; }
 }
 
-export function saveIdentity(path, segment, { replace = false } = {}) {
-  const doc = replace ? {} : (loadIdentity(path) || { schema: 'aec.identity/v2', endpoint: null, run: null, author: null });
-  const merged = { ...doc, ...segment, schema: 'aec.identity/v2' };
+export function saveCredentials(path, segment, { replace = false } = {}) {
+  const doc = replace ? {} : (loadCredentials(path) || { schema: 'aec.credentials/v1', endpoint: null, run: null, author: null });
+  const merged = { ...doc, ...segment, schema: 'aec.credentials/v1' };
   mkdirSync(join(path, '..'), { recursive: true, mode: 0o700 });
   writeFileSync(path, JSON.stringify(merged, null, 2), { mode: 0o600 });
   return merged;
 }
+
+// 兼容读取旧版 identity.json（aec.identity/v2，机器绑定形态）：v2.0 客户端不再
+// 使用机器绑定令牌；探测到旧文件时给出一次性迁移提示，不读取其内容。
+export function detectLegacyIdentity(path) {
+  try {
+    const doc = JSON.parse(readFileSync(path, 'utf8'));
+    return doc?.schema === 'aec.identity/v2' ? path : null;
+  } catch { return null; }
+}
+
+// 兼容别名：旧调用点（loadIdentity/saveIdentity）等价于 credentials 版本。
+export const loadIdentity = loadCredentials;
+export const saveIdentity = saveCredentials;
