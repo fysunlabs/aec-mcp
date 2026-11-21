@@ -19,7 +19,8 @@ import { createHash } from 'node:crypto';
 import { randomUUID } from 'node:crypto';
 import { defaultIdentityDir } from '../identity.mjs';
 import { localMemoryMode, federationMode, DB_SCHEMA } from './flags.mjs';
-import { ftsText, ftsQuery } from './fts.mjs';
+import { ftsText, ftsQuery, mksTokens } from './fts.mjs';
+import { recallRank } from './critic.mjs';
 
 export const HOST_MKS_SCHEMA = 'aec-mcp.host-mks/v1';
 export const BUNDLE_VERSION = '1';
@@ -241,6 +242,29 @@ export class HostMksStore {
       `SELECT m.* FROM host_memory_fts f JOIN host_memory m ON m.rowid = f.rowid
        WHERE host_memory_fts MATCH ? AND m.status != 'forgotten' ORDER BY rank LIMIT ?`
     ).all(match, limit).map(rowToMemory);
+  }
+
+  /**
+   * P2-1（5.0-R-099）：召回过 memory critic。FTS 候选 → token 覆盖率作 relevance →
+   * 四因子评分 → 低分不注入 + gaps + citation/why。默认 top-k 3–5。
+   * 只读：不写任何表（auditing 在写路径，recall 不产生审计行）。
+   */
+  recall({ query, kinds = null, scopes = null, opts = {}, now = Date.now() } = {}) {
+    const cands = this.searchMemories({ query, limit: 50 }).map((m) => {
+      if (kinds && !kinds.includes(m.kind)) return null;
+      if (scopes && !scopes.includes(m.scope)) return null;
+      const qTokens = mksTokens(query);
+      const textTokens = new Set(mksTokens([m.title, m.summary, m.content && JSON.stringify(m.content)].filter(Boolean).join(' ')));
+      const hit = qTokens.filter(t => textTokens.has(t)).length;
+      const relevance = qTokens.length ? hit / qTokens.length : 0;
+      return { ...m, relevance, citation: { source: 'host_memory', id: m.memory_id, origin: m.origin } };
+    }).filter(Boolean);
+    const ranked = recallRank(cands, { ...opts, now, query });
+    return {
+      ...ranked,
+      items: ranked.injected,
+      limits: ['fts_only'], // P2 边界：graph/business/vector 融合在 P3
+    };
   }
 
   // --- knowledge 模块 -------------------------------------------------------------

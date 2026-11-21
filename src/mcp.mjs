@@ -560,7 +560,27 @@ export function createMcpV2(kernel, { profile = 'run', endpoint = null, credenti
 // --- stdio main (pure remote client) ---------------------------------------
 export async function main() {
   const profile = process.argv.includes('--profile', 2) ? process.argv[process.argv.indexOf('--profile', 2) + 1] : 'run';
-  requireThat(['run', 'author'].includes(profile), 'invalid_profile', `未知 profile：${profile}（可选 run/author）`);
+  requireThat(['run', 'author', 'local'].includes(profile), 'invalid_profile', `未知 profile：${profile}（可选 run/author/local）`);
+
+  // P2-2：`--profile local` = aec_local 宿主本地工具面，独立路径，不建远端
+  // kernel、不探测端点、不提示密钥（5.0-R-098）。只访问 host-mks.sqlite。
+  if (profile === 'local') {
+    const { createLocalMcp, detectLocalHostMode } = await import('./mcp-local.mjs');
+    const { HostMksStore } = await import('./mks/store.mjs');
+    const { resolveHostMksPath } = await import('./mks/store.mjs');
+    const mode = detectLocalHostMode({ env: process.env });
+    let store = null;
+    if (mode === 'node' || mode === 'sovereign') {
+      store = new HostMksStore({ path: resolveHostMksPath(), env: { ...process.env, AEC_MCP_LOCAL_MEMORY: mode } });
+    }
+    const server = createLocalMcp(store, { env: process.env });
+    const close = () => { try { store?.close(); } catch { /* ignore */ } };
+    for (const event of ['end', 'close']) process.stdin.once(event, close);
+    for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, close);
+    await server.connect(new StdioServerTransport());
+    return;
+  }
+
   // run profile 免配置：未设 AEC_KERNEL_URL 时回落官方云端（首次连接自动提示）；
   // author 端点公网不可用，resolveEndpoint 强制显式提供。
   const endpoint = resolveEndpoint({ profile });

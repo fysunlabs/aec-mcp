@@ -81,8 +81,31 @@ if (cmd === 'roles') {
     const mks = new HostMksStore({ path: dbPath, env: process.env });
     console.log(JSON.stringify({ ok: true, forgotten: mks.forgetMemory({ memory_id: args[1] }) }, null, 2));
     mks.close();
+  } else if (sub === 'memory' && args[0] === 'export') {
+    // P2-4 用户控制：导出全部（含 forgotten）记忆为可读 JSON；--out 落盘。
+    const mks = new HostMksStore({ path: dbPath, env: process.env });
+    const rows = mks.db.prepare('SELECT * FROM host_memory ORDER BY created_at, rowid').all();
+    const doc = { schema: 'aec.memory-export/v1', exported_at: new Date().toISOString(), count: rows.length, items: rows };
+    const outIdx = args.indexOf('--out');
+    if (outIdx >= 0 && args[outIdx + 1]) { writeFileSync(args[outIdx + 1], JSON.stringify(doc, null, 2)); console.log(JSON.stringify({ ok: true, out: args[outIdx + 1], count: rows.length }, null, 2)); }
+    else console.log(JSON.stringify(doc, null, 2));
+    mks.close();
+  } else if (sub === 'ingest') {
+    // P2-3 用户控制：MD/HTML 文件 → Host MKS 文档/切片/claim。
+    const file = args[0];
+    if (!file || !existsSync(file)) die('ingest 需要 -- <file.md|file.html>');
+    const { ingestDocument } = await import('./mks/ingest.mjs');
+    const content = readFileSync(file, 'utf8');
+    const fmt = /\.(md|markdown|html?|txt)$/i.exec(file)?.[1]?.toLowerCase() || 'md';
+    const mks = new HostMksStore({ path: dbPath, env: process.env });
+    const res = ingestDocument(mks, {
+      title: valueOf(args, '--title') || null, source_uri: pathToFileURL(file).href,
+      media_type: fmt, content, format: fmt, extractClaims: args.includes('--claims'),
+    });
+    console.log(JSON.stringify({ ok: true, ...res }, null, 2));
+    mks.close();
   } else {
-    process.stderr.write(`用法：aec-mcp mks [status|export [--scopes=...] [--out f]|import --file f|purge --yes|rebuild|memory list|memory show <id>|memory forget <id>]\n`);
+    process.stderr.write(`用法：aec-mcp mks [status|export [--scopes=...] [--out f]|import --file f|purge --yes|rebuild|memory list|memory show <id>|memory forget <id>|memory export [--out f]|ingest <file> [--claims] [--title <t>]]\n`);
     process.exitCode = 2;
   }
 

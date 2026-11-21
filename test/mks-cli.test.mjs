@@ -80,4 +80,27 @@ test('mks status / memory list / purge --yes / export / rebuild 全链路', () =
   assert.equal(rb.status, 0);
 });
 
+test('mks ingest <file> + memory export：P2 知识入库与用户导出', () => {
+  const dir = tmp();
+  const mdFile = join(dir, 'manual.md');
+  writeFileSync(mdFile, '# 部署手册\n\n生产部署必须先 staging 再 canary。\n\n## 回滚\n\n失败就回滚。');
+  const ing = run(['ingest', mdFile, '--claims', '--title', '部署手册'], { dir });
+  assert.equal(ing.status, 0, ing.stderr);
+  const ingOut = JSON.parse(ing.stdout);
+  assert.equal(ingOut.ok, true);
+  assert.ok(ingOut.chunks >= 2);
+  assert.ok(ingOut.citation.digest);
+
+  const st = JSON.parse(run(['status'], { dir }).stdout);
+  assert.ok(st.counts.document >= 1 && st.counts.chunk >= 2, 'document/chunk 入库');
+
+  // memory export（含 forgotten）：导出为可读 JSON
+  const expOut = join(dir, 'mem.json');
+  const exp = run(['memory', 'export', '--out', expOut], { dir });
+  assert.equal(exp.status, 0, exp.stderr);
+  const doc = readJson(expOut);
+  assert.equal(doc.schema, 'aec.memory-export/v1');
+  assert.ok(Array.isArray(doc.items));
+});
+
 function readJson(p) { return JSON.parse(readFileSync(p, 'utf8')); }
