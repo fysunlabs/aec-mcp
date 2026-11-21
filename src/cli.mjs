@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// aec-mcp CLI: stdio MCP server (default) + local role/device management.
+// aec-mcp CLI: stdio MCP server (default) + local role/device management
+// + Host MKS administration (AEC 5.0.0 P1-07).
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { realpathSync } from 'node:fs';
+import { realpathSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 
 const cmd = process.argv[2];
 
@@ -18,6 +19,77 @@ if (cmd === 'roles') {
     process.exitCode = 2;
   }
   db.close();
+} else if (cmd === 'mks') {
+  // Host MKS 管理命令（P1-07）。status 永远只读（lite/无库不建库）；其余子命令
+  // 需要 node/sovereign 形态。purge 是唯一破坏性命令，必须 --yes（ADR §3.6 卸载）。
+  const { HostMksStore, resolveHostMksPath } = await import('./mks/store.mjs');
+  const { flagsSnapshot } = await import('./mks/flags.mjs');
+  const sub = process.argv[3] || 'status';
+  const args = process.argv.slice(4);
+  const dbPath = resolveHostMksPath();
+  const die = (msg, code = 2) => { process.stderr.write(`[aec-mcp mks] ${msg}\n`); process.exit(code); };
+
+  if (sub === 'status') {
+    const snap = flagsSnapshot();
+    if (snap.local_memory_mode === 'lite') {
+      console.log(JSON.stringify({ ...snap, db_exists: false, db: null, note: 'lite 不建库（ADR §3.3）' }, null, 2));
+    } else if (!existsSync(dbPath)) {
+      console.log(JSON.stringify({ ...snap, db_exists: false, db: null, path: dbPath }, null, 2));
+    } else {
+      const mks = new HostMksStore({ path: dbPath, env: process.env });
+      console.log(JSON.stringify({ ...snap, db_exists: true, path: dbPath, ...mks.status() }, null, 2));
+      mks.close();
+    }
+  } else if (sub === 'export') {
+    const scopes = (args.find(a => a.startsWith('--scopes'))?.split('=')[1] ?? 'memory,knowledge,experience,business').split(',').filter(Boolean);
+    const outIdx = args.indexOf('--out');
+    const outPath = outIdx >= 0 ? args[outIdx + 1] : null;
+    const mks = new HostMksStore({ path: dbPath, env: process.env });
+    const bundle = mks.exportBundle({ scopes });
+    if (outPath) { writeFileSync(outPath, JSON.stringify(bundle, null, 2)); console.log(JSON.stringify({ ok: true, out: outPath, items: bundle.items.length, digest: bundle.digest }, null, 2)); }
+    else console.log(JSON.stringify(bundle, null, 2));
+    mks.close();
+  } else if (sub === 'import') {
+    const fileIdx = args.indexOf('--file');
+    const file = fileIdx >= 0 ? args[fileIdx + 1] : null;
+    if (!file || !existsSync(file)) die('import 需要 --file <bundle.json>');
+    const bundle = JSON.parse(readFileSync(file, 'utf8'));
+    const mks = new HostMksStore({ path: dbPath, env: process.env });
+    console.log(JSON.stringify({ ok: true, result: mks.importBundle(bundle) }, null, 2));
+    mks.close();
+  } else if (sub === 'purge') {
+    if (!args.includes('--yes')) die('purge 是破坏性命令，必须 --yes 确认（ADR-AEC-5.0-host-local-memory §3.6）');
+    const mks = new HostMksStore({ path: dbPath, env: process.env });
+    console.log(JSON.stringify({ ok: true, purged: mks.purge() }, null, 2));
+    mks.close();
+  } else if (sub === 'rebuild') {
+    const mks = new HostMksStore({ path: dbPath, env: process.env });
+    mks.rebuildFts();
+    console.log(JSON.stringify({ ok: true, rebuilt: ['host_memory_fts', 'host_chunk_fts'] }, null, 2));
+    mks.close();
+  } else if (sub === 'memory' && (args[0] === 'list' || !args[0])) {
+    const mks = new HostMksStore({ path: dbPath, env: process.env });
+    console.log(JSON.stringify({ items: mks.listMemories({ kind: valueOf(args, '--kind'), status: valueOf(args, '--status') }) }, null, 2));
+    mks.close();
+  } else if (sub === 'memory' && args[0] === 'show' && args[1]) {
+    const mks = new HostMksStore({ path: dbPath, env: process.env });
+    const item = mks.getMemory({ memory_id: args[1] });
+    if (!item) die(`memory 不存在：${args[1]}`, 1);
+    console.log(JSON.stringify({ item }, null, 2));
+    mks.close();
+  } else if (sub === 'memory' && args[0] === 'forget' && args[1]) {
+    const mks = new HostMksStore({ path: dbPath, env: process.env });
+    console.log(JSON.stringify({ ok: true, forgotten: mks.forgetMemory({ memory_id: args[1] }) }, null, 2));
+    mks.close();
+  } else {
+    process.stderr.write(`用法：aec-mcp mks [status|export [--scopes=...] [--out f]|import --file f|purge --yes|rebuild|memory list|memory show <id>|memory forget <id>]\n`);
+    process.exitCode = 2;
+  }
+
+  function valueOf(arr, flag) {
+    const i = arr.indexOf(flag);
+    return i >= 0 ? arr[i + 1] : undefined;
+  }
 } else {
   // Default: launch the MCP server (pass through --profile etc.).
   // 与 mcp.mjs 直跑入口一致：启动期失败（占位 URL / 端点不可达 / 缺密钥等）只给
