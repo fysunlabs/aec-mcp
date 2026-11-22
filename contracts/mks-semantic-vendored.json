@@ -1,0 +1,161 @@
+{
+  "schema": "aec.mks-semantic-contract/v1",
+  "version": "1.0.0",
+  "generated_at": "2026-11-22T00:00:00Z",
+  "purpose": "AEC 5.1 O3-07：Cloud 与 Host MKS 的语义契约。两侧不必物理同 schema（Cloud kernel sqlite / Host aec-mcp sqlite 独立），但同一概念的状态枚举与字段语义必须一致。契约由两侧 fixtures 契约测试共同校验；Host 侧使用 vendored 副本 + digest 校验同步。",
+  "concepts": {
+    "memory": {
+      "cloud_table": "mks_memory",
+      "host_table": "host_memory",
+      "note": "经验记忆；candidate 优先（LLM/Agent 写入默认 candidate，不自动 public/进化——硬约束 5）"
+    },
+    "claim": {
+      "cloud_table": "mks_claim",
+      "host_table": "host_claim",
+      "note": "三元组断言；导入一律 candidate"
+    },
+    "episode": {
+      "cloud_table": "mks_episode",
+      "host_table": "host_episode",
+      "note": "情景；无归属 subject → unknown_owner 隔离（5.1-R-011）"
+    },
+    "guidance": {
+      "cloud_table": "mks_package_guidance",
+      "host_table": "host_package_guidance",
+      "note": "在岗带教；guidance 不是契约（5.1-R-001~004）；Host 镜像只读 candidate"
+    }
+  },
+  "status_enums": {
+    "memory": [
+      "candidate",
+      "verified",
+      "forgotten",
+      "superseded"
+    ],
+    "guidance": [
+      "candidate",
+      "active",
+      "retired",
+      "expired",
+      "codified"
+    ],
+    "guidance_event": [
+      "delivered",
+      "rendered",
+      "effect"
+    ],
+    "document": [
+      "active",
+      "deleted"
+    ]
+  },
+  "field_mappings": [
+    {
+      "field": "memory.kind",
+      "cloud_values": [
+        "episodic",
+        "semantic",
+        "procedural",
+        "business",
+        "reflective",
+        "normative"
+      ],
+      "host_values": [
+        "episodic",
+        "semantic",
+        "procedural",
+        "business",
+        "reflective",
+        "normative"
+      ]
+    },
+    {
+      "field": "memory.scope",
+      "cloud_values": [
+        "session",
+        "project",
+        "tenant",
+        "global"
+      ],
+      "host_values": [
+        "session",
+        "project",
+        "tenant",
+        "global"
+      ]
+    },
+    {
+      "field": "memory.sensitivity",
+      "cloud_values": [
+        "public",
+        "internal",
+        "confidential",
+        "restricted"
+      ],
+      "host_values": [
+        "public",
+        "internal",
+        "confidential",
+        "restricted"
+      ],
+      "note": "秩：public < internal < confidential < restricted（过滤用）"
+    },
+    {
+      "field": "guidance.kind",
+      "cloud_values": [
+        "correction",
+        "tip",
+        "preference",
+        "terminology",
+        "resource_hint",
+        "pitfall",
+        "parameter_default"
+      ],
+      "host_values": [
+        "correction",
+        "tip",
+        "preference",
+        "terminology",
+        "resource_hint",
+        "pitfall",
+        "parameter_default"
+      ]
+    }
+  ],
+  "fixtures": [
+    {
+      "name": "memory-kind-roundtrip",
+      "input": {
+        "kind": "episodic",
+        "scope": "tenant",
+        "confidence": 0.5,
+        "status": "candidate"
+      },
+      "expect": {
+        "both_sides_accept": true
+      }
+    },
+    {
+      "name": "memory-kind-invalid",
+      "input": {
+        "kind": "coach",
+        "scope": "tenant"
+      },
+      "expect": {
+        "both_sides_reject": "memory_kind_invalid"
+      }
+    },
+    {
+      "name": "memory-scope-invalid",
+      "input": {
+        "kind": "semantic",
+        "scope": "globalx"
+      },
+      "expect": {
+        "both_sides_reject": "memory_scope_invalid"
+      }
+    }
+  ],
+  "vendored_from": "aec/contracts/mks-semantic/contract.json",
+  "source_digest": "sha256:fb911173a535ed53b35371a8df1e4cd9b81bfcf71d887b4b7e3033d9afc49e22"
+}

@@ -21,6 +21,7 @@ import { defaultIdentityDir } from '../identity.mjs';
 import { localMemoryMode, federationMode, DB_SCHEMA } from './flags.mjs';
 import { ftsText, ftsQuery, mksTokens } from './fts.mjs';
 import { recallRank } from './critic.mjs';
+import { verifySignature } from './federation-sign.mjs';
 
 export const HOST_MKS_SCHEMA = 'aec-mcp.host-mks/v1';
 export const BUNDLE_VERSION = '1';
@@ -159,14 +160,14 @@ const HOST_MIGRATIONS = [
         observed_at TEXT NOT NULL);
       -- 包级带教镜像（O2-11，只读表；Cloud export → Host import）
       CREATE TABLE IF NOT EXISTS host_package_guidance(
-        guidance_id TEXT PRIMARY KEY, origin_node TEXT, tenant_id TEXT, project_id TEXT,
+        guidance_id TEXT NOT NULL, origin_node TEXT, tenant_id TEXT, project_id TEXT,
         user_id TEXT, package_id TEXT, version_range TEXT, scope TEXT, kind TEXT,
         applies_to_json TEXT, statement TEXT, source TEXT, source_refs_json TEXT,
         user_quote TEXT, author TEXT, status TEXT, codified_in TEXT,
         expires_at TEXT, usage_count INTEGER NOT NULL DEFAULT 0,
         helped INTEGER NOT NULL DEFAULT 0, hurt INTEGER NOT NULL DEFAULT 0,
         created_at TEXT, updated_at TEXT,
-        UNIQUE(origin_node, guidance_id, updated_at));
+        PRIMARY KEY(origin_node, guidance_id, updated_at));
     `,
   },
 ];
@@ -630,6 +631,21 @@ export class HostMksStore {
     require2(bundle?.bundle_version === BUNDLE_VERSION, 'bundle_version_invalid', `bundle_version 必须 ${BUNDLE_VERSION}`);
     require2(Array.isArray(bundle.items), 'bundle_items_invalid', 'items 必须是数组');
     require2(bundle.node_id, 'bundle_node_invalid', 'node_id 必填');
+    // AEC 5.1 O3-08（A22）：bundle 签名校验。无签名 → 放行（旧 bundle 兼容）；
+    // 有签名 → 验签失败或无法验证（无公钥）时整包拒绝（fail-closed），不接受任何 item。
+    if (bundle.signature) {
+      const ok = bundle.signing_pubkey
+        ? verifySignature(bundle.digest, bundle.signature, bundle.signing_pubkey)
+        : false;
+      if (!ok) {
+        this.db.prepare(
+          'INSERT INTO host_federation_log(log_id,direction,peer_node,bundle_digest,tables_json,counts_json,status,at) VALUES(?,?,?,?,?,?,?,?)'
+        ).run(randomUUID(), 'import', peer_node ?? bundle.node_id, bundle.digest ?? null, JSON.stringify(bundle.tables ?? []),
+          JSON.stringify({ accepted: 0, duplicate: 0, rejected: bundle.items.length }), 'signature_invalid', nowIso());
+        this._audit({ action: 'host.federation.import', target: `${bundle.node_id}/sig-fail` });
+        return { accepted: 0, duplicate: 0, rejected: bundle.items.map(it => ({ ref: it.ref, kind: it.kind, reason: 'signature_invalid' })) };
+      }
+    }
     const origin = bundle.node_id;
     let accepted = 0; let duplicate = 0; const rejected = [];
     for (const it of bundle.items) {
