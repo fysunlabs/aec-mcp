@@ -4,7 +4,7 @@
 // ADR-AEC-5.0-host-local-memory §3.3（lite/node/sovereign）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { localMemoryMode, federationMode, flagsSnapshot } from '../src/mks/flags.mjs';
+import { localMemoryMode, federationMode, flagsSnapshot, mcpContinuityEnabled } from '../src/mks/flags.mjs';
 
 test('clean env → lite + none (Host MKS off, node-independent)', () => {
   assert.equal(localMemoryMode({}), 'lite');
@@ -13,6 +13,7 @@ test('clean env → lite + none (Host MKS off, node-independent)', () => {
     schema: 'aec.mks.flags/v1',
     local_memory_mode: 'lite',
     federation_mode: 'none',
+    mcp_continuity: false,
   });
 });
 
@@ -24,4 +25,14 @@ test('explicit modes parsed; case-insensitive; invalid → conservative', () => 
   assert.equal(federationMode({ AEC_FEDERATION: 'export' }), 'export');
   assert.equal(federationMode({ AEC_FEDERATION: 'bidirectional' }), 'bidirectional');
   assert.equal(federationMode({ AEC_FEDERATION: 'sync' }), 'none');
+});
+
+test('5.1 O0-06: AEC_MCP_CONTINUITY default off, only "1" enables (5.1-R-005)', () => {
+  assert.equal(mcpContinuityEnabled({}), false);
+  assert.equal(mcpContinuityEnabled({ AEC_MCP_CONTINUITY: 'node' }), false);
+  assert.equal(mcpContinuityEnabled({ AEC_MCP_CONTINUITY: '1' }), true);
+  // sidecar 需 node + continuity 同时为真；continuity=1 但 lite 形态下快照仍如实上报两者
+  const snap = flagsSnapshot({ AEC_MCP_CONTINUITY: '1', AEC_MCP_LOCAL_MEMORY: 'node' });
+  assert.equal(snap.mcp_continuity, true);
+  assert.equal(snap.local_memory_mode, 'node');
 });
