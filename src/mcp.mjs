@@ -18,6 +18,19 @@ import { createRemoteKernel, inlineExtractionFile, validateEndpoint, probeEndpoi
 import { resolveRolesDbPath } from './db/roles.mjs';
 import { RolesDB } from './db/roles.mjs';
 import { defaultIdentityDir, credentialsPath, loadCredentials, saveCredentials, detectLegacyIdentity } from './identity.mjs';
+// AEC 5.1 O1-03：透明连续性 sidecar（flag-gated，默认 off 字节等价）
+import { ContinuityCache, runContinuitySidecar } from './continuity.mjs';
+import { createSubjectResolver } from './subject.mjs';
+import { mcpContinuityEnabled, localMemoryMode } from './mks/flags.mjs';
+
+// 模块级惰性状态：仅在 continuity 生效时创建；进程级缓存，不落盘。
+let _continuityCache = null;
+let _subjectResolver = null;
+const continuityActive = (env = process.env) => mcpContinuityEnabled(env) && localMemoryMode(env) === 'node';
+const continuityCache = () => (_continuityCache ??= new ContinuityCache());
+const subjectResolver = (endpoint) => (_subjectResolver ??= createSubjectResolver({
+  verify: async (apiKey) => verifyApiKey({ endpoint, api_key: apiKey }),
+}));
 
 const readJson = p => { try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; } };
 
@@ -63,7 +76,50 @@ export function aecEdgeHandlers(kernel) {
         ? (() => { const [id, version] = args.experience_ref.split('@'); return id && version ? { id, version } : args.experience_ref; })()
         : args.experience_ref;
       // P0-2（F2）：query 原样透传给内核（g067）；不传时不出现该键，远端 JSON 语义不变。
-      const payload = await kernel.call('aec', { op: 'open', intent: args.intent, experience_ref: refArg, trial_of: args.trial_of, ...(args.query ? { query: args.query } : {}) });
+      // ---- AEC 5.1 O1-03 透明连续性 sidecar（仅 continuity+node 生效；默认字节等价）----
+      // 关键路径：kernel open 与增量 recall 并发；sidecar 只读 continuity cache。
+      const cActive = continuityActive();
+      let cSubject = null, cIncremental = null;
+      if (cActive) {
+        try {
+          const cred = kernel.credential?.();
+          if (cred?.source === 'env') cSubject = await subjectResolver(kernel.endpoint).fromEnvKey(cred.api_key);
+          else {
+            const seg = loadCredentials(credentialsPath())?.[cred?.profile || 'run'];
+            cSubject = subjectResolver(kernel.endpoint).fromCredential(seg?.subject);
+          }
+          if (cSubject) {
+            cIncremental = (async () => {
+              try {
+                const { HostMksStore, resolveHostMksPath } = await import('./mks/store.mjs');
+                const { existsSync: ex } = await import('node:fs');
+                const dbPath = resolveHostMksPath();
+                if (!ex(dbPath)) return [];
+                const store = new HostMksStore({ path: dbPath, env: process.env });
+                const r = store.recallScoped({ query: args.intent, user_id: cSubject,
+                  tenant_id: null, thread_id: args.conversation_id || null, opts: { top_k: 5 } });
+                store.close();
+                return r.items || [];
+              } catch { return []; }
+            })();
+          }
+        } catch { cSubject = null; }
+      }
+      // kernelP 与 sidecar 并发；sidecar 内部以 kernelP 的完成时刻判定增量早到/晚到。
+      const kernelP = kernel.call('aec', { op: 'open', intent: args.intent, experience_ref: refArg, trial_of: args.trial_of, ...(args.query ? { query: args.query } : {}), ...(args.conversation_id ? { conversation_id: args.conversation_id } : {}) });
+      let continuityResult = null;
+      let payload;
+      if (cActive) {
+        const sidecarP = runContinuitySidecar({
+          enabled: true, subject: cSubject, cache: continuityCache(),
+          scope: { tenant: 'default', user_id: cSubject, thread_id: args.conversation_id || null },
+          query: args.intent, incrementalRecall: cIncremental, kernelOpen: kernelP, timeoutMs: 150,
+          now: () => performance.now(),
+        }).catch(() => null);
+        [payload, continuityResult] = await Promise.all([kernelP, sidecarP]);
+      } else {
+        payload = await kernelP;
+      }
       // G2 补漏：创作类意图由内核改道，不建会话、不匹配包。
       if (payload.code === 'authoring_redirect') {
         return { content: [{ type: 'text', text: payload.message }], structuredContent: payload };
@@ -88,6 +144,14 @@ export function aecEdgeHandlers(kernel) {
       if (trialRoot) {
         mat.markdown = `【试用 · 阶段 4/5 · 不是交付】产物写入沙箱 ${ws.root}（不在用户项目里，验证完即弃）。${args.workspace ? `\n      · 你给的 workspace=${args.workspace} 已被忽略：试用不允许写真实项目目录。` : ''}\n      · 这轮只证明循环能跑通；不要把它当成为用户实施，也不要改用户真实目录。\n      · 跑完 close 拿 grade；authoritative 才能回 author 侧 publish。\n\n${mat.markdown}`;
         mat.structuredContent.trial = { of: args.trial_of, sandbox: ws.root, delivery: false, ...(args.workspace ? { ignored_workspace: args.workspace } : {}) };
+      }
+      // 5.1 O1-03：透明连续性注入（独立区块 + structuredContent，数据不是指令）。
+      // continuity off / no_identity 时 continuityResult 为 null 或 markdown 为空 → 输出逐字节不变。
+      if (continuityResult?.markdown) {
+        mat.markdown = `${mat.markdown}\n\n${continuityResult.markdown}`;
+      }
+      if (continuityResult) {
+        mat.structuredContent.continuity = continuityResult.structured;
       }
       return { content: [{ type: 'text', text: mat.markdown }], structuredContent: mat.structuredContent };
     },
@@ -434,6 +498,8 @@ export function createMcpV2(kernel, { profile = 'run', endpoint = null, credenti
       trial_of: z.string().optional().describe('试用交接：draft 返回的造包会话 id（内核核验绑定）'),
       // 3.2.0 g067：aec 只增加可选 query；不传走旧匹配，intent 永不被覆盖。
       query: z.record(z.unknown()).optional().describe('op=open 可选：aec.task-query/v1 宿主 query 理解结果'),
+      // 5.1 O1-00b（5.1-R-011）：可选 conversation_id，仅分线程、不授权；绝不加 user_id。
+      conversation_id: z.string().max(128).optional().describe('op=open 可选：线程分隔 id（≤128）；不用于身份/授权'),
     },
   }, async args => {
     try { return await handlers[args.op || 'open'](args); }

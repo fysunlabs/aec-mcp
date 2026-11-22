@@ -118,6 +118,57 @@ const HOST_MIGRATIONS = [
         at TEXT NOT NULL);
     `,
   },
+  {
+    version: 2,
+    description: 'host-mks/v2 (AEC 5.1 O1-00c/O1-01): scope link + thread/episode/preference + retrieval event + package guidance (O2 mirror). Additive only, reentrant.',
+    sql: `
+      -- 5.1-R-014：统一作用域链接，覆盖 memory/business_term/preference/episode/chunk/claim/element
+      -- （含 knowledge 与 experience）。无链接的旧行 → unknown_owner 隔离区，默认不注入。
+      CREATE TABLE IF NOT EXISTS host_scope_link(
+        object_type TEXT NOT NULL, object_id TEXT NOT NULL,
+        tenant_id TEXT, user_id TEXT, project_id TEXT, thread_id TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(object_type, object_id));
+      CREATE INDEX IF NOT EXISTS idx_host_scope_link_subject ON host_scope_link(tenant_id, user_id, thread_id);
+      -- 会话线程（O1-01）
+      CREATE TABLE IF NOT EXISTS host_thread(
+        thread_id TEXT PRIMARY KEY, user_id TEXT, tenant_id TEXT,
+        title TEXT, status TEXT NOT NULL DEFAULT 'open',
+        last_episode_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      -- episode（O1-03 close 写入）
+      CREATE TABLE IF NOT EXISTS host_episode(
+        episode_id TEXT PRIMARY KEY, thread_id TEXT, user_id TEXT, tenant_id TEXT,
+        package_id TEXT, summary TEXT, outcome TEXT, status TEXT,
+        open_items_json TEXT NOT NULL DEFAULT '[]',
+        correction_refs_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS idx_host_episode_thread ON host_episode(thread_id, created_at);
+      -- 偏好（O1-04）：显式 > 推断；supersedes；do_not_use 永不召回；candidate 0.5
+      CREATE TABLE IF NOT EXISTS host_preference(
+        preference_id TEXT PRIMARY KEY, user_id TEXT, tenant_id TEXT,
+        key TEXT NOT NULL, value TEXT, source TEXT NOT NULL DEFAULT 'explicit',
+        scope TEXT NOT NULL DEFAULT 'session', confidence REAL NOT NULL DEFAULT 0.5,
+        status TEXT NOT NULL DEFAULT 'candidate', supersedes TEXT,
+        do_not_use INTEGER NOT NULL DEFAULT 0,
+        last_confirmed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      -- 留出对照事件（O1-07 / 5.1-R-012）：utility 只由对照差异更新
+      CREATE TABLE IF NOT EXISTS host_memory_retrieval_event(
+        event_id TEXT PRIMARY KEY, memory_id TEXT NOT NULL, thread_id TEXT,
+        user_id TEXT, tenant_id TEXT, held_out INTEGER NOT NULL DEFAULT 0,
+        injected INTEGER NOT NULL DEFAULT 0, task_success INTEGER,
+        observed_at TEXT NOT NULL);
+      -- 包级带教镜像（O2-11，只读表；Cloud export → Host import）
+      CREATE TABLE IF NOT EXISTS host_package_guidance(
+        guidance_id TEXT PRIMARY KEY, origin_node TEXT, tenant_id TEXT, project_id TEXT,
+        user_id TEXT, package_id TEXT, version_range TEXT, scope TEXT, kind TEXT,
+        applies_to_json TEXT, statement TEXT, source TEXT, source_refs_json TEXT,
+        user_quote TEXT, author TEXT, status TEXT, codified_in TEXT,
+        expires_at TEXT, usage_count INTEGER NOT NULL DEFAULT 0,
+        helped INTEGER NOT NULL DEFAULT 0, hurt INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT, updated_at TEXT,
+        UNIQUE(origin_node, guidance_id, updated_at));
+    `,
+  },
 ];
 
 export function migrateHostMks(db) {
@@ -235,6 +286,25 @@ export class HostMksStore {
     this._audit({ action: 'host.memory.forget', target: memory_id });
     return 1;
   }
+  // O1-05 aec_local edit：更新候选记忆的可编辑字段（title/summary/confidence）；同步 FTS。
+  updateMemory({ memory_id, title = undefined, summary = undefined, confidence = undefined }) {
+    require2(memory_id, 'memory_required', 'memory_id 必填');
+    const cur = this.db.prepare('SELECT * FROM host_memory WHERE memory_id=?').get(memory_id);
+    if (!cur) throw Object.assign(new Error('memory_not_found'), { code: 'memory_not_found' });
+    const next = {
+      title: title === undefined ? cur.title : title,
+      summary: summary === undefined ? cur.summary : summary,
+      confidence: confidence === undefined ? cur.confidence : confidence,
+    };
+    this.db.prepare('UPDATE host_memory SET title=?, summary=?, confidence=?, updated_at=? WHERE memory_id=?')
+      .run(next.title, next.summary, next.confidence, nowIso(), memory_id);
+    // 重建该行 FTS（SELECT * 不含隐式 rowid，需单独取）
+    const rowid = Number(this.db.prepare('SELECT rowid FROM host_memory WHERE memory_id=?').get(memory_id).rowid);
+    this.db.prepare('DELETE FROM host_memory_fts WHERE rowid=?').run(rowid);
+    this.db.prepare('INSERT INTO host_memory_fts(rowid,text) VALUES(?,?)').run(rowid, ftsText([next.title, next.summary]));
+    this._audit({ action: 'host.memory.edit', target: memory_id });
+    return this.getMemory({ memory_id });
+  }
   searchMemories({ query, limit = 20 } = {}) {
     const match = ftsQuery(query);
     if (!match) return [];
@@ -242,6 +312,66 @@ export class HostMksStore {
       `SELECT m.* FROM host_memory_fts f JOIN host_memory m ON m.rowid = f.rowid
        WHERE host_memory_fts MATCH ? AND m.status != 'forgotten' ORDER BY rank LIMIT ?`
     ).all(match, limit).map(rowToMemory);
+  }
+
+  // ---- AEC 5.1 O1-00c：统一作用域链接（5.1-R-011/R-014，只加不改）----------------
+  // 覆盖 7 类对象（memory/business_term/preference/episode/chunk/claim/element，
+  // 含 knowledge 与 experience）。新写入必须有链接；旧行无链接 → unknown_owner 隔离区。
+  putScopeLink({ object_type, object_id, tenant_id = null, user_id = null, project_id = null, thread_id = null }) {
+    const TYPES = ['memory', 'business_term', 'preference', 'episode', 'chunk', 'claim', 'element'];
+    require2(TYPES.includes(object_type) && object_id, 'scope_link_invalid', `object_type∈{${TYPES.join(',')}} 且 object_id 必填`);
+    this.db.prepare(`INSERT INTO host_scope_link(object_type,object_id,tenant_id,user_id,project_id,thread_id,created_at)
+      VALUES(?,?,?,?,?,?,?) ON CONFLICT(object_type,object_id) DO UPDATE SET
+      tenant_id=excluded.tenant_id, user_id=excluded.user_id, project_id=excluded.project_id, thread_id=excluded.thread_id`)
+      .run(object_type, object_id, tenant_id, user_id, project_id, thread_id, nowIso());
+    return { object_type, object_id, tenant_id, user_id, project_id, thread_id };
+  }
+  getScopeLink({ object_type, object_id }) {
+    return this.db.prepare('SELECT * FROM host_scope_link WHERE object_type=? AND object_id=?').get(object_type, object_id) || null;
+  }
+  // 旧数据（无链接）清单——供 `aec_local list --legacy` 与一次性迁移确认。
+  // object_type→(表,主键列) 显式映射，避免字符串拼接猜测列名。
+  listLegacy({ object_type = 'memory', limit = 500 } = {}) {
+    const MAP = {
+      memory: ['host_memory', 'memory_id'],
+      business_term: ['host_business_term', 'term_id'],
+      preference: ['host_preference', 'preference_id'],
+      chunk: ['host_chunk', 'chunk_id'],
+      claim: ['host_claim', 'claim_id'],
+      element: ['host_element', 'element_id'],
+      episode: ['host_episode', 'episode_id'],
+    };
+    const m = MAP[object_type];
+    require2(m, 'scope_type_invalid', `object_type 必须是 ${Object.keys(MAP).join('|')}`);
+    const [table, pk] = m;
+    return this.db.prepare(`SELECT o.* FROM ${table} o
+      WHERE NOT EXISTS (SELECT 1 FROM host_scope_link l WHERE l.object_type=? AND l.object_id=o.${pk})
+      ORDER BY o.rowid LIMIT ?`).all(object_type, limit);
+  }
+  // 一次性迁移绑定：仅当本机该 tenant 只有一个 subject 时可自动绑定，否则需逐条确认。
+  claimLegacy({ object_type, object_id, tenant_id, user_id }) {
+    require2(user_id, 'subject_required', 'claim-legacy 需要显式 subject（不自动推断）');
+    return this.putScopeLink({ object_type, object_id, tenant_id, user_id });
+  }
+  // 作用域过滤召回（O1-02/O1-03 sidecar 用）：默认排除 unknown_owner（无链接）。
+  // 只返回链接 user_id/tenant_id/thread_id 与请求主体匹配的对象；传 allowUnknown=true
+  // 仅供已确认归属的迁移场景（需用户确认后才可调用），默认 false。
+  recallScoped({ query, user_id, tenant_id = null, thread_id = null, allowUnknown = false, opts = {}, now = Date.now() } = {}) {
+    const cands = this.searchMemories({ query, limit: 50 }).map((m) => {
+      const link = this.getScopeLink({ object_type: 'memory', object_id: m.memory_id });
+      if (!link) return allowUnknown ? { ...m, _scoped: false } : null; // unknown_owner 默认不注入
+      if (user_id && link.user_id !== user_id) return null;
+      if (tenant_id && link.tenant_id !== tenant_id) return null;
+      if (thread_id && link.thread_id && link.thread_id !== thread_id) return null; // 线程作用域（NULL=跨线程可见）
+      const qTokens = mksTokens(query);
+      const textTokens = new Set(mksTokens([m.title, m.summary, m.content && JSON.stringify(m.content)].filter(Boolean).join(' ')));
+      const hit = qTokens.filter(t => textTokens.has(t)).length;
+      const relevance = qTokens.length ? hit / qTokens.length : 0;
+      return { ...m, relevance, _scoped: true, citation: { source: 'host_memory', id: m.memory_id, origin: m.origin } };
+    }).filter(Boolean);
+    const ranked = recallRank(cands, { ...opts, now, query });
+    return { ...ranked, items: ranked.injected, limits: ['fts_only', 'scope_filtered'],
+      meta: { ...(ranked.meta || {}), unknown_owner_excluded: !allowUnknown } };
   }
 
   /**

@@ -112,5 +112,73 @@ export function createLocalMcp(store = null, { env = process.env } = {}) {
     } catch (e) { return fail(e); }
   });
 
+  // ---- AEC 5.1 O1-05：用户控制面（list/show/edit/forget/export）----
+  // 统一 ADR 用词 edit（非 correct）；list --legacy 用于确认旧数据归属。
+  server.registerTool('list', {
+    description: '列出宿主本地记忆（只读）。legacy=true 列出无作用域链接的旧数据（unknown_owner 隔离区）供归属确认。',
+    inputSchema: {
+      kind: z.string().optional(), status: z.string().optional(), limit: z.number().int().min(1).max(500).optional(),
+      legacy: z.boolean().optional().describe('true=列出无 scope link 的旧对象（默认不注入隔离区）'),
+      object_type: z.enum(['memory', 'business_term', 'preference', 'episode', 'chunk', 'claim', 'element']).optional(),
+    },
+  }, async (args) => {
+    try {
+      const s = needStore();
+      if (args.legacy) return text({ code: 'ok', legacy: true, object_type: args.object_type || 'memory',
+        items: s.listLegacy({ object_type: args.object_type || 'memory', limit: args.limit || 500 }) });
+      return text({ code: 'ok', items: s.listMemories({ kind: args.kind, status: args.status, limit: args.limit || 100 }) });
+    } catch (e) { return fail(e); }
+  });
+
+  server.registerTool('show', {
+    description: '查看一条宿主本地记忆详情（只读）。',
+    inputSchema: { memory_id: z.string().describe('记忆 id') },
+  }, async (args) => {
+    try {
+      const s = needStore();
+      const m = s.getMemory({ memory_id: args.memory_id });
+      if (!m) return text({ code: 'not_found', memory_id: args.memory_id });
+      return text({ code: 'ok', memory: m, scope_link: s.getScopeLink?.({ object_type: 'memory', object_id: args.memory_id }) ?? null });
+    } catch (e) { return fail(e); }
+  });
+
+  server.registerTool('edit', {
+    description: '编辑一条候选记忆（title/summary/confidence）。仅 candidate 可改；verified 需人工走审计。',
+    inputSchema: {
+      memory_id: z.string(), title: z.string().optional(), summary: z.string().optional(),
+      confidence: z.number().min(0).max(1).optional(),
+    },
+  }, async (args) => {
+    try {
+      const s = needStore();
+      const cur = s.getMemory({ memory_id: args.memory_id });
+      if (!cur) return text({ code: 'not_found', memory_id: args.memory_id });
+      if (cur.status === 'verified') return text({ code: 'edit_verified_denied', hint: 'verified 记忆不可直接编辑；请新建候选并用 supersedes 关联。' });
+      const m = s.updateMemory({ memory_id: args.memory_id, title: args.title, summary: args.summary, confidence: args.confidence });
+      return text({ code: 'edited', memory_id: m.memory_id, status: m.status });
+    } catch (e) { return fail(e); }
+  });
+
+  server.registerTool('forget', {
+    description: '遗忘一条记忆：status=forgotten，FTS 删除，永不召回（幂等）。',
+    inputSchema: { memory_id: z.string() },
+  }, async (args) => {
+    try {
+      const s = needStore();
+      const n = s.forgetMemory({ memory_id: args.memory_id });
+      return text({ code: n ? 'forgotten' : 'not_found', memory_id: args.memory_id });
+    } catch (e) { return fail(e); }
+  });
+
+  server.registerTool('export', {
+    description: '导出宿主本地 bundle（只读，签名前草案）；用于联邦 export 与备份。',
+    inputSchema: { limit: z.number().int().min(1).max(5000).optional() },
+  }, async (args) => {
+    try {
+      const s = needStore();
+      return text({ code: 'ok', bundle: s.exportBundle({ limit: args.limit || 1000 }) });
+    } catch (e) { return fail(e); }
+  });
+
   return server;
 }
