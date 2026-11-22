@@ -28,12 +28,13 @@ test('工具面隔离：local 含 describe/recall/remember + 5.1 控制面 5 工
   }
 });
 
-test('形态判定：显式优先；未显式时 Node22+磁盘达标→node，不达标→lite', () => {
+test('形态判定（O1-06）：显式优先；显式 node 才执行 Node 判定（不满足降级 lite）；未显式默认 lite', () => {
   const ok = { env: {}, probe: () => 3 * 1024 ** 3 };
   assert.equal(detectLocalHostMode({ env: { AEC_MCP_LOCAL_MEMORY: 'sovereign' }, probe: ok.probe }), 'sovereign');
-  assert.equal(detectLocalHostMode({ env: {}, probe: ok.probe }), 'node');
-  assert.equal(detectLocalHostMode({ env: {}, probe: () => 100 }), 'lite');
-  assert.equal(detectLocalHostMode({ env: { AEC_MCP_LOCAL_MEMORY: 'node' }, probe: () => 0 }), 'node', '显式 node 忽略判定');
+  assert.equal(detectLocalHostMode({ env: { AEC_MCP_LOCAL_MEMORY: 'node' }, probe: ok.probe }), 'node', '显式 node + Node22+/磁盘达标');
+  assert.equal(detectLocalHostMode({ env: { AEC_MCP_LOCAL_MEMORY: 'node' }, probe: () => 0 }), 'lite', '显式 node 但磁盘不足 → 降级 lite（O1-06）');
+  assert.equal(detectLocalHostMode({ env: { AEC_MCP_LOCAL_MEMORY: 'lite' }, probe: ok.probe }), 'lite');
+  assert.equal(detectLocalHostMode({ env: {} }), 'lite', '5.1 未显式默认 lite（自动判定留给 3.0，另立 ADR）');
 });
 
 test('lite 降级：store=null 时全部工具都返回 host_mks_lite，不崩溃', async () => {

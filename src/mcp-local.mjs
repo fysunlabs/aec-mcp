@@ -26,9 +26,10 @@ const MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024; // ≥2GB（§5.9）
  */
 export function detectLocalHostMode({ env = process.env, probe = null } = {}) {
   const explicit = String(env.AEC_MCP_LOCAL_MEMORY ?? '').trim().toLowerCase();
-  if (['node', 'lite', 'sovereign'].includes(explicit)) return explicit; // 显式优先
-
-  // 未显式设置：local profile 显式 opt-in → 尝试 Node 判定，不满足降级 lite。
+  // O1-06（plan.3 §5.2 修订）：5.1 默认 lite（与 off 等价不冲突）；只有显式 node 才执行
+  // Node 判定（Node 22+、≥2GB 磁盘），不满足就降级 lite 并提示。「默认 node」留给 3.0（另立 ADR）。
+  if (explicit === 'lite' || explicit === 'sovereign') return explicit; // 显式非 node 直接生效
+  if (explicit !== 'node') return 'lite'; // 未显式 → 5.1 默认 lite
   const nodeOk = Number((process.versions.node || '0').split('.')[0]) >= 22;
   let diskOk = false;
   const check = probe || ((p) => {

@@ -14,6 +14,7 @@
 // （macOS 无 APPDATA 环境变量，自然落 ~/.config/aec；Linux 同）。
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { homedir } from 'node:os';
 import { warn } from './edge/util.mjs';
 
 // 统一默认基础目录（credentials.json / author.key / sessions-index.json / roles.sqlite 共用）。
@@ -21,7 +22,8 @@ export function defaultIdentityDir({ env = process.env } = {}) {
   if (env.AEC_IDENTITY_DIR) return env.AEC_IDENTITY_DIR;
   if (env.XDG_CONFIG_HOME) return join(env.XDG_CONFIG_HOME, 'aec');
   if (process.platform === 'win32' && env.APPDATA) return join(env.APPDATA, 'aec');
-  return join(env.HOME || process.env.USERPROFILE, '.config', 'aec');
+  // 无 HOME/USERPROFILE 的精简 env（测试/守护进程）也不抛错：回落 os.homedir()
+  return join(env.HOME || process.env.USERPROFILE || homedir(), '.config', 'aec');
 }
 
 export function resolveIdentityPath({ env = process.env, explicit = null, workspaceAecDir = null } = {}) {
