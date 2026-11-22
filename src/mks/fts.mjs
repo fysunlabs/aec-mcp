@@ -35,3 +35,38 @@ export function ftsQuery(q) {
   if (!toks.length) return null;
   return toks.map(t => `"${t.replace(/"/g, '""')}"`).join(' ');
 }
+
+// ---- AEC 5.1 O3-11/O3-13：查询构造辅助（与 kernel 侧 fts.mjs 同名同语义） ----
+
+/** 查询 → FTS5 OR 表达式（v2 分层查询的 OR 层；与 kernel ftsQueryOr 同语义）。 */
+export function ftsQueryOr(q) {
+  const toks = mksTokens(String(q ?? ''));
+  if (!toks.length) return null;
+  return toks.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
+}
+
+/** 查询 token 序列 → FTS5 MATCH 表达式（token 已由调用方剥停用词/加别名）。 */
+export function ftsMatchExpr(tokens, op = 'AND') {
+  const toks = (tokens ?? []).map(String).filter(Boolean);
+  if (!toks.length) return null;
+  return toks.map(t => `"${t.replace(/"/g, '""')}"`).join(` ${op} `);
+}
+
+// AEC 5.1 O3-11：词段覆盖率——按 CJK 连续段（伪词）/ASCII token 计覆盖，
+// 段内 ≥50% gram 命中即整段覆盖，coverage = 覆盖字符数 / 总字符数。
+// 相比「全部 bigram 命中数 / 全部 bigram 数」，消除跨词噪声 gram 对分母的系统性放大。
+export function segmentCoverage(query, textTokenSet) {
+  const CJK_RUN = /([㐀-鿿぀-ヿ가-힯]+)|([a-z0-9_./:@#+~-]+)/gi;
+  let total = 0, covered = 0, m;
+  const src = String(query ?? '').toLowerCase();
+  CJK_RUN.lastIndex = 0;
+  while ((m = CJK_RUN.exec(src))) {
+    const seg = m[0];
+    const grams = mksTokens(seg);
+    if (!grams.length) continue;
+    const hits = grams.filter(g => textTokenSet.has(g)).length;
+    total += seg.length;
+    if (hits / grams.length >= 0.5) covered += seg.length;
+  }
+  return total ? covered / total : 0;
+}

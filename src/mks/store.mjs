@@ -18,8 +18,9 @@ import { hostname } from 'node:os';
 import { createHash } from 'node:crypto';
 import { randomUUID } from 'node:crypto';
 import { defaultIdentityDir } from '../identity.mjs';
-import { localMemoryMode, federationMode, DB_SCHEMA } from './flags.mjs';
-import { ftsText, ftsQuery, mksTokens } from './fts.mjs';
+import { localMemoryMode, federationMode, DB_SCHEMA, searchV2Enabled } from './flags.mjs';
+import { ftsText, ftsQuery, ftsMatchExpr, mksTokens, segmentCoverage } from './fts.mjs';
+import { stripStopwords, stripStopwordsFromText } from './stopwords.mjs';
 import { recallRank } from './critic.mjs';
 import { verifySignature } from './federation-sign.mjs';
 
@@ -197,6 +198,7 @@ export class HostMksStore {
     require2(path, 'host_mks_path_required', '需要 path（host-mks.sqlite 路径）');
     this.path = path;
     this.mode = mode;
+    this.env = env ?? process.env;
     this.node_id = node_id ?? env.AEC_MCP_NODE_ID ?? `host:${hostname()}`;
     this.actor = actor;
     this.federation = federationMode(env);
@@ -249,11 +251,16 @@ export class HostMksStore {
     const SCOPES = ['session', 'project', 'tenant', 'global'];
     require2(KINDS.includes(kind), 'memory_kind_invalid', `kind 必须是 ${KINDS.join('|')}`);
     require2(SCOPES.includes(scope), 'memory_scope_invalid', `scope 必须是 ${SCOPES.join('|')}`);
+    // AEC 5.1 O3-10③（R-016）：status 参数显式传入时尊重（candidate|verified|stale）；
+    // 缺省仍为 candidate（LLM/Agent 写入默认 candidate，不自动 public）。此前 INSERT 硬编码
+    // 'candidate'，连 store API 显式 status 也被覆盖——与云侧 putMemory 行为不一致。
+    const writeStatus = status ?? 'candidate';
+    require2(['candidate', 'verified', 'stale', 'superseded'].includes(writeStatus), 'memory_status_invalid', 'status ∈ candidate|verified|stale|superseded');
     const memory_id = randomUUID();
     const at = nowIso();
     this.db.prepare(
       'INSERT INTO host_memory(memory_id,kind,scope,title,summary,content_json,confidence,sensitivity,status,source_json,supersedes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)'
-    ).run(memory_id, kind, scope, title, summary, j(content), confidence, sensitivity, 'candidate', j(source ?? {}), supersedes, at, at);
+    ).run(memory_id, kind, scope, title, summary, j(content), confidence, sensitivity, writeStatus, j(source ?? {}), supersedes, at, at);
     const rowid = Number(this.db.prepare('SELECT rowid FROM host_memory WHERE memory_id=?').get(memory_id).rowid);
     this.db.prepare('INSERT INTO host_memory_fts(rowid,text) VALUES(?,?)').run(rowid, ftsText([title, summary]));
     this._audit({ action: 'host.memory.put', target: memory_id });
@@ -306,13 +313,89 @@ export class HostMksStore {
     this._audit({ action: 'host.memory.edit', target: memory_id });
     return this.getMemory({ memory_id });
   }
-  searchMemories({ query, limit = 20 } = {}) {
-    const match = ftsQuery(query);
-    if (!match) return [];
-    return this.db.prepare(
-      `SELECT m.* FROM host_memory_fts f JOIN host_memory m ON m.rowid = f.rowid
-       WHERE host_memory_fts MATCH ? AND m.status != 'forgotten' ORDER BY rank LIMIT ?`
-    ).all(match, limit).map(rowToMemory);
+  searchMemories({ query, limit = 20, opts = {} } = {}) {
+    // AEC 5.1 O3-10~14：v2（AEC_MKS_SEARCH_V2=1）走分层查询 + candidate 默认排除；
+    // off 时与 2.0/O1 语义逐字节等价（只排 forgotten）。
+    if (!searchV2Enabled(this.env)) {
+      const match = ftsQuery(query);
+      if (!match) return [];
+      return this.db.prepare(
+        `SELECT m.* FROM host_memory_fts f JOIN host_memory m ON m.rowid = f.rowid
+         WHERE host_memory_fts MATCH ? AND m.status != 'forgotten' ORDER BY rank LIMIT ?`
+      ).all(match, limit).map(rowToMemory);
+    }
+    const cleanQuery = stripStopwordsFromText(query);
+    const rows = this._searchMemoriesV2({ query: cleanQuery, limit, opts });
+    return rows.map(rowToMemory);
+  }
+
+  /** O3-11/O3-13（Host 侧）：停用词剥离 + AND 不足降级 OR（词段覆盖 ≥0.35 或 ≥2 gram 直击；别名层需短查询/≥2 直击/词面全含）+ direct 降序。 */
+  _searchMemoriesV2({ query, limit = 20, opts = {} } = {}) {
+    const includeCandidate = opts?.include_candidate === true;
+    const tokens = stripStopwords(mksTokens(stripStopwordsFromText(query)));
+    if (!tokens.length) return [];
+    const aliasEntries = this._aliasTermsForHost(tokens);
+    const aliasTokensFlat = [...new Set(aliasEntries.flatMap(e => e.tokens))].filter(t => !tokens.includes(t));
+    const andMatch = ftsMatchExpr(tokens, 'AND');
+    const orMatch = ftsMatchExpr([...tokens, ...aliasTokensFlat], 'OR');
+    const excluded = includeCandidate ? "('forgotten','superseded')" : "('forgotten','superseded','candidate')";
+    const run = (match, lim = limit) => (match ? this.db.prepare(
+      `SELECT m0.*, f.rank AS _rank FROM host_memory_fts f JOIN host_memory m0 ON m0.rowid = f.rowid
+       WHERE host_memory_fts MATCH ? AND m0.status NOT IN ${excluded} ORDER BY f.rank LIMIT ?`
+    ).all(match, lim) : []);
+    const andRows = run(andMatch);
+    const out = andRows.map(r => ({ ...r, _stage: 'and', _alias: null }));
+    if (out.length < limit && orMatch) {
+      const seen = new Set(andRows.map(r => r.memory_id));
+      const cand = [];
+      for (const r of run(orMatch, Math.min(Math.max(limit * 4, 24), 64))) {
+        if (cand.length >= limit) break;
+        if (seen.has(r.memory_id)) continue;
+        seen.add(r.memory_id);
+        const tset = new Set(mksTokens([r.title, r.summary].filter(Boolean).join(' ')));
+        const direct = tokens.filter(t => tset.has(t)).length;
+        const coverage = segmentCoverage(query, tset);
+        let aliasHit = null, aliasCov = 0;
+        for (const e of aliasEntries) {
+          const hits = e.tokens.filter(t => tset.has(t)).length;
+          if (hits) {
+            const cov = hits / Math.max(e.tokens.length, 1);
+            if (cov > aliasCov) { aliasCov = cov; aliasHit = e.label; }
+          }
+        }
+        if (coverage >= 0.35 || direct >= 2) cand.push({ r, stage: 'or', direct, aliasHit: null });
+        else if (aliasHit && (tokens.length <= 2 || direct >= 2 || (aliasCov >= 1 && (direct === 0 || direct / tokens.length >= 0.15)))) cand.push({ r, stage: 'alias', direct, aliasHit });
+      }
+      cand.sort((a, b) => b.direct - a.direct);
+      for (const x of cand) out.push({ ...x.r, _stage: x.stage, _alias: x.aliasHit });
+    }
+    return out;
+  }
+
+  /** O3-13（Host 侧）：host_business_term（kind='terminology'，term=别名，detail=规范词）双向展开。 */
+  _aliasTermsForHost(tokens) {
+    // 触发即生成条目（即使别名词已在查询 token 中）；host_business_term：kind='terminology'，term=别名，detail=规范词
+    const entries = [];
+    const seenAlias = new Set();
+    let rows = [];
+    try {
+      rows = this.db.prepare(
+        "SELECT term, detail FROM host_business_term WHERE kind='terminology' AND detail IS NOT NULL AND status != 'forgotten'"
+      ).all();
+    } catch { /* 表未迁移（旧库）时不扩展 */ }
+    for (const t of tokens) {
+      for (const row of rows) {
+        const names = [];
+        if (row.term === t && row.detail) names.push(row.detail);
+        if (row.detail === t && row.term) names.push(row.term);
+        for (const name of names) {
+          if (seenAlias.has(name)) continue;
+          seenAlias.add(name);
+          entries.push({ label: name, tokens: mksTokens(name) });
+        }
+      }
+    }
+    return entries;
   }
 
   // ---- AEC 5.1 O1-00c：统一作用域链接（5.1-R-011/R-014，只加不改）----------------
@@ -358,7 +441,8 @@ export class HostMksStore {
   // 只返回链接 user_id/tenant_id/thread_id 与请求主体匹配的对象；传 allowUnknown=true
   // 仅供已确认归属的迁移场景（需用户确认后才可调用），默认 false。
   recallScoped({ query, user_id, tenant_id = null, thread_id = null, allowUnknown = false, opts = {}, now = Date.now() } = {}) {
-    const cands = this.searchMemories({ query, limit: 50 }).map((m) => {
+    const v2 = searchV2Enabled(this.env);
+    const cands = this.searchMemories({ query, limit: 50, opts }).map((m) => {
       const link = this.getScopeLink({ object_type: 'memory', object_id: m.memory_id });
       if (!link) return allowUnknown ? { ...m, _scoped: false } : null; // unknown_owner 默认不注入
       if (user_id && link.user_id !== user_id) return null;
@@ -370,6 +454,20 @@ export class HostMksStore {
       const relevance = qTokens.length ? hit / qTokens.length : 0;
       return { ...m, relevance, _scoped: true, citation: { source: 'host_memory', id: m.memory_id, origin: m.origin } };
     }).filter(Boolean);
+    if (v2) {
+      // O3-12：bm25 rank 在候选集内 min-max 归一（rank ≤0，越负越相关）。
+      // 绝对值映射 1/(1+|rank|) 会随查询长度/语料规模塌缩（多 token OR 的 rank 可达 -30），
+      // 候选集内相对归一才有区分度且跨查询稳定；别名层 ×0.8 降权。
+      const ranks = cands.map(c => Number(c._rank ?? 0));
+      const min = Math.min(...ranks, 0);
+      const max = Math.max(...ranks, 0);
+      for (const c of cands) {
+        const r = Number(c._rank ?? 0);
+        let rel = max === min ? 1 : (max - r) / (max - min);
+        if (c._stage === 'alias') rel *= 0.8;
+        c.relevance = rel;
+      }
+    }
     const ranked = recallRank(cands, { ...opts, now, query });
     return { ...ranked, items: ranked.injected, limits: ['fts_only', 'scope_filtered'],
       meta: { ...(ranked.meta || {}), unknown_owner_excluded: !allowUnknown } };

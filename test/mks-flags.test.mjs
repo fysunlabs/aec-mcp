@@ -15,6 +15,7 @@ test('clean env → lite + none (Host MKS off, node-independent)', () => {
     federation_mode: 'none',
     mcp_continuity: false,
     mcp_guidance: false,
+    mks_search_v2: false,
   });
 });
 
