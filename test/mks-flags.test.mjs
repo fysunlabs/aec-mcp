@@ -14,6 +14,7 @@ test('clean env → lite + none (Host MKS off, node-independent)', () => {
     local_memory_mode: 'lite',
     federation_mode: 'none',
     mcp_continuity: false,
+    mcp_guidance: false,
   });
 });
 

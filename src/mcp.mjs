@@ -20,8 +20,9 @@ import { RolesDB } from './db/roles.mjs';
 import { defaultIdentityDir, credentialsPath, loadCredentials, saveCredentials, detectLegacyIdentity } from './identity.mjs';
 // AEC 5.1 O1-03：透明连续性 sidecar（flag-gated，默认 off 字节等价）
 import { ContinuityCache, runContinuitySidecar } from './continuity.mjs';
+import { renderGuidance } from './guidance-render.mjs';
 import { createSubjectResolver } from './subject.mjs';
-import { mcpContinuityEnabled, localMemoryMode } from './mks/flags.mjs';
+import { mcpContinuityEnabled, mcpGuidanceEnabled, localMemoryMode } from './mks/flags.mjs';
 
 // 模块级惰性状态：仅在 continuity 生效时创建；进程级缓存，不落盘。
 let _continuityCache = null;
@@ -152,6 +153,15 @@ export function aecEdgeHandlers(kernel) {
       }
       if (continuityResult) {
         mat.structuredContent.continuity = continuityResult.structured;
+      }
+      // AEC 5.1 O2-03：管理员带教独立区块（AEC_MCP_GUIDANCE=1 才渲染；默认字节等价）。
+      // guidance 由 kernel 可选返回；注入模式由 renderGuidance 过滤，不改判据。
+      if (mcpGuidanceEnabled() && payload.guidance) {
+        const gr = renderGuidance(payload.guidance);
+        if (gr) {
+          mat.markdown = `${mat.markdown}\n\n${gr.markdown}`;
+          mat.structuredContent.guidance = gr.structured;
+        }
       }
       return { content: [{ type: 'text', text: mat.markdown }], structuredContent: mat.structuredContent };
     },

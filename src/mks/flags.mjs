@@ -32,6 +32,8 @@ export const federationMode = (env = process.env) => {
 // 默认关闭（5.1-R-005：仅 node + continuity 同时为真时 sidecar 生效）。
 // 纯 env 读取，不建库、不挂行为；行为在 O1 才接入。clean env → false。
 export const mcpContinuityEnabled = (env = process.env) => env.AEC_MCP_CONTINUITY === '1';
+// AEC 5.1 O2-03：Host 侧带教渲染开关（默认 off；kernel 侧 AEC_GUIDANCE_ENABLED 独立）。
+export const mcpGuidanceEnabled = (env = process.env) => env.AEC_MCP_GUIDANCE === '1';
 
 // 快照供 `aec-mcp mks status`（P1）与验收证据使用。
 // schema 保持 aec.mks.flags/v1：新增字段纯追加，off 等价测试断言默认关闭。
@@ -41,5 +43,6 @@ export function flagsSnapshot(env = process.env) {
     local_memory_mode: localMemoryMode(env),
     federation_mode: federationMode(env),
     mcp_continuity: mcpContinuityEnabled(env),
+    mcp_guidance: mcpGuidanceEnabled(env),
   };
 }

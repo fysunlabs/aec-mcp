@@ -611,6 +611,13 @@ export class HostMksStore {
         items.push({ kind: 'business.term', ref: r.term_id, payload: r });
       }
     }
+    // AEC 5.1 O2-11：bundle kind `package.guidance`（Host 只读镜像的导出面）。
+    if (scopes.includes('guidance')) {
+      for (const r of this.db.prepare("SELECT * FROM host_package_guidance WHERE status='active' ORDER BY created_at LIMIT ?").all(limit)) {
+        items.push({ kind: 'package.guidance', ref: r.guidance_id,
+          payload: { ...r, applies_to: pj(r.applies_to_json, []), source_refs: pj(r.source_refs_json, []) } });
+      }
+    }
     const digest = `sha256:${createHash('sha256').update(JSON.stringify(items)).digest('hex')}`;
     const bundle = { bundle_version: BUNDLE_VERSION, node_id: this.node_id, generated_at: nowIso(), tables: scopes, items, digest };
     this.db.prepare(
@@ -657,6 +664,33 @@ export class HostMksStore {
           this.db.prepare(
             'INSERT OR IGNORE INTO host_business_term(term_id,kind,term,detail,impact,status,created_at,updated_at,origin_node,origin_id) VALUES(?,?,?,?,?,?,?,?,?,?)'
           ).run(term_id, p.kind, p.term, p.detail ?? null, p.impact ?? 'low', 'candidate', at, at, origin, it.ref);
+          accepted++;
+        } else if (it.kind === 'package.guidance') {
+          // AEC 5.1 O2-11：幂等键 (origin_node, guidance_id, updated_at)；tenant/ACL 过滤。
+          const p = it.payload;
+          const tenant = p.tenant_id ?? 'default';
+          const allowedTenants = Array.isArray(bundle.allowed_tenants) ? bundle.allowed_tenants : null;
+          if (allowedTenants && !allowedTenants.includes(tenant)) {
+            rejected.push({ ref: it.ref, kind: it.kind, reason: 'tenant_not_allowed' });
+            continue;
+          }
+          const updatedAt = p.updated_at ?? nowIso();
+          const dup = this.db.prepare('SELECT 1 FROM host_package_guidance WHERE origin_node=? AND guidance_id=? AND updated_at=?').get(origin, p.guidance_id, updatedAt);
+          if (dup) { duplicate++; continue; }
+          if (p.acl === 'private' || p.sensitivity === 'private') {
+            rejected.push({ ref: it.ref, kind: it.kind, reason: 'acl_private_not_importable' });
+            continue;
+          }
+          this.db.prepare(`INSERT INTO host_package_guidance(
+            guidance_id,origin_node,tenant_id,project_id,user_id,package_id,version_range,scope,kind,
+            applies_to_json,statement,source,source_refs_json,user_quote,author,status,codified_in,
+            expires_at,usage_count,helped,hurt,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+            .run(p.guidance_id, origin, tenant, p.project_id ?? null, p.user_id ?? null,
+              p.package_id, p.version_range ?? '>=0', p.scope ?? 'package', p.kind ?? 'tip',
+              j(p.applies_to ?? []), p.statement, p.source ?? 'admin', j(p.source_refs ?? []),
+              p.user_quote ?? null, p.author ?? null, 'candidate', p.codified_in ?? null,
+              p.expires_at ?? null, 0, 0, 0, p.created_at ?? nowIso(), updatedAt);
           accepted++;
         } else {
           rejected.push({ ref: it.ref, kind: it.kind, reason: 'kind_not_importable_yet' });
