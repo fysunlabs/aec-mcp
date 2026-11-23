@@ -21,6 +21,7 @@ import { defaultIdentityDir, credentialsPath, loadCredentials, saveCredentials, 
 // AEC 5.1 O1-03：透明连续性 sidecar（flag-gated，默认 off 字节等价）
 import { ContinuityCache, runContinuitySidecar } from './continuity.mjs';
 import { renderGuidance } from './guidance-render.mjs';
+import { renderComposition } from './composition-render.mjs';
 import { createSubjectResolver } from './subject.mjs';
 import { mcpContinuityEnabled, mcpGuidanceEnabled, localMemoryMode } from './mks/flags.mjs';
 
@@ -156,6 +157,16 @@ export function aecEdgeHandlers(kernel) {
       }
       // AEC 5.1 O2-03：管理员带教独立区块（AEC_MCP_GUIDANCE=1 才渲染；默认字节等价）。
       // guidance 由 kernel 可选返回；注入模式由 renderGuidance 过滤，不改判据。
+      // AEC 5.1 O3-16：组合建议独立区块（kernel 可选返回才有；默认字节等价）。
+      if (payload.composition_proposal) {
+        const cp = renderComposition(payload.composition_proposal);
+        if (cp) {
+          mat.markdown = `${mat.markdown}
+
+${cp.markdown}`;
+          mat.structuredContent.composition = cp.structured;
+        }
+      }
       if (mcpGuidanceEnabled() && payload.guidance) {
         const gr = renderGuidance(payload.guidance);
         if (gr) {
