@@ -34,6 +34,8 @@ export const federationMode = (env = process.env) => {
 export const mcpContinuityEnabled = (env = process.env) => env.AEC_MCP_CONTINUITY === '1';
 // AEC 5.1 O2-03：Host 侧带教渲染开关（默认 off；kernel 侧 AEC_GUIDANCE_ENABLED 独立）。
 export const mcpGuidanceEnabled = (env = process.env) => env.AEC_MCP_GUIDANCE === '1';
+// AEC 5.1 O3-04：Host 侧知识投递渲染开关（默认 off；kernel 侧 AEC_KNOWLEDGE_DELIVERY 独立）。
+export const mcpKnowledgeEnabled = (env = process.env) => env.AEC_MCP_KNOWLEDGE === '1';
 // AEC 5.1 O3-10~14（plan3续 §4.1）：Host 检索 V2（candidate 默认排除 / bm25 归一 relevance /
 // 分层 AND→OR+停用词 / business_term 别名扩展）。默认 0：off 时 searchMemories/recallScoped 逐字节等价。
 export const searchV2Enabled = (env = process.env) => env.AEC_MKS_SEARCH_V2 === '1';
@@ -53,6 +55,7 @@ export function flagsSnapshot(env = process.env) {
     federation_mode: federationMode(env),
     mcp_continuity: mcpContinuityEnabled(env),
     mcp_guidance: mcpGuidanceEnabled(env),
+    mcp_knowledge: mcpKnowledgeEnabled(env),
     mks_search_v2: searchV2Enabled(env),
     mks_rerank: mksRerank(env),
     mks_rerank_topn: mksRerankTopN(env),

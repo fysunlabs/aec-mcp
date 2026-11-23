@@ -21,9 +21,10 @@ import { defaultIdentityDir, credentialsPath, loadCredentials, saveCredentials, 
 // AEC 5.1 O1-03：透明连续性 sidecar（flag-gated，默认 off 字节等价）
 import { ContinuityCache, runContinuitySidecar } from './continuity.mjs';
 import { renderGuidance } from './guidance-render.mjs';
+import { renderKnowledge } from './knowledge-render.mjs';
 import { renderComposition } from './composition-render.mjs';
 import { createSubjectResolver } from './subject.mjs';
-import { mcpContinuityEnabled, mcpGuidanceEnabled, localMemoryMode } from './mks/flags.mjs';
+import { mcpContinuityEnabled, mcpGuidanceEnabled, mcpKnowledgeEnabled, localMemoryMode } from './mks/flags.mjs';
 
 // 模块级惰性状态：仅在 continuity 生效时创建；进程级缓存，不落盘。
 let _continuityCache = null;
@@ -172,6 +173,14 @@ ${cp.markdown}`;
         if (gr) {
           mat.markdown = `${mat.markdown}\n\n${gr.markdown}`;
           mat.structuredContent.guidance = gr.structured;
+        }
+      }
+      // AEC 5.1 O3-04：知识投递独立区块（kernel 可选返回 knowledge；host flag off/无命中字节等价）。
+      if (mcpKnowledgeEnabled() && payload.knowledge) {
+        const kr = renderKnowledge(payload.knowledge);
+        if (kr) {
+          mat.markdown = `${mat.markdown}\n\n${kr.markdown}`;
+          mat.structuredContent.knowledge = kr.structured;
         }
       }
       return { content: [{ type: 'text', text: mat.markdown }], structuredContent: mat.structuredContent };
