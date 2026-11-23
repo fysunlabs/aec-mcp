@@ -37,6 +37,12 @@ export const mcpGuidanceEnabled = (env = process.env) => env.AEC_MCP_GUIDANCE ==
 // AEC 5.1 O3-10~14（plan3续 §4.1）：Host 检索 V2（candidate 默认排除 / bm25 归一 relevance /
 // 分层 AND→OR+停用词 / business_term 别名扩展）。默认 0：off 时 searchMemories/recallScoped 逐字节等价。
 export const searchV2Enabled = (env = process.env) => env.AEC_MKS_SEARCH_V2 === '1';
+// O3-14：MKS 检索 LLM rerank 钩子（宿主侧执行）。默认 0；TOPN 默认 10、上限 20。
+export const mksRerank = (env = process.env) => env.AEC_MKS_RERANK === '1';
+export const mksRerankTopN = (env = process.env) => {
+  const n = Number(env.AEC_MKS_RERANK_TOPN);
+  return Number.isFinite(n) && n >= 1 ? Math.min(Math.floor(n), 20) : 10;
+};
 
 // 快照供 `aec-mcp mks status`（P1）与验收证据使用。
 // schema 保持 aec.mks.flags/v1：新增字段纯追加，off 等价测试断言默认关闭。
@@ -48,5 +54,7 @@ export function flagsSnapshot(env = process.env) {
     mcp_continuity: mcpContinuityEnabled(env),
     mcp_guidance: mcpGuidanceEnabled(env),
     mks_search_v2: searchV2Enabled(env),
+    mks_rerank: mksRerank(env),
+    mks_rerank_topn: mksRerankTopN(env),
   };
 }

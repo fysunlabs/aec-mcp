@@ -16,6 +16,8 @@ test('clean env → lite + none (Host MKS off, node-independent)', () => {
     mcp_continuity: false,
     mcp_guidance: false,
     mks_search_v2: false,
+    mks_rerank: false,
+    mks_rerank_topn: 10,
   });
 });
 

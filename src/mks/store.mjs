@@ -18,8 +18,9 @@ import { hostname } from 'node:os';
 import { createHash } from 'node:crypto';
 import { randomUUID } from 'node:crypto';
 import { defaultIdentityDir } from '../identity.mjs';
-import { localMemoryMode, federationMode, DB_SCHEMA, searchV2Enabled } from './flags.mjs';
+import { localMemoryMode, federationMode, DB_SCHEMA, searchV2Enabled, mksRerank } from './flags.mjs';
 import { ftsText, ftsQuery, ftsMatchExpr, mksTokens, segmentCoverage } from './fts.mjs';
+import { applyMksRerank, mksRerankTopN } from './rerank.mjs';
 import { stripStopwords, stripStopwordsFromText } from './stopwords.mjs';
 import { recallRank } from './critic.mjs';
 import { verifySignature } from './federation-sign.mjs';
@@ -332,6 +333,8 @@ export class HostMksStore {
   /** O3-11/O3-13（Host 侧）：停用词剥离 + AND 不足降级 OR（词段覆盖 ≥0.35 或 ≥2 gram 直击；别名层需短查询/≥2 直击/词面全含）+ direct 降序。 */
   _searchMemoriesV2({ query, limit = 20, opts = {} } = {}) {
     const includeCandidate = opts?.include_candidate === true;
+    // O3-14 rerank-on 两段式：wide_or=词法召回放宽，精度由 rerank 裁决（缺省 false 语义不变）
+    const wideOr = opts?.wide_or === true;
     const tokens = stripStopwords(mksTokens(stripStopwordsFromText(query)));
     if (!tokens.length) return [];
     const aliasEntries = this._aliasTermsForHost(tokens);
@@ -363,8 +366,8 @@ export class HostMksStore {
             if (cov > aliasCov) { aliasCov = cov; aliasHit = e.label; }
           }
         }
-        if (coverage >= 0.35 || direct >= 2) cand.push({ r, stage: 'or', direct, aliasHit: null });
-        else if (aliasHit && (tokens.length <= 2 || direct >= 2 || (aliasCov >= 1 && (direct === 0 || direct / tokens.length >= 0.15)))) cand.push({ r, stage: 'alias', direct, aliasHit });
+        if (wideOr || coverage >= 0.35 || direct >= 2) cand.push({ r, stage: 'or', direct, aliasHit: null });
+        else if (aliasHit && (tokens.length <= 2 || direct >= 1 || aliasCov >= 1)) cand.push({ r, stage: 'alias', direct, aliasHit });
       }
       cand.sort((a, b) => b.direct - a.direct);
       for (const x of cand) out.push({ ...x.r, _stage: x.stage, _alias: x.aliasHit });
@@ -471,6 +474,13 @@ export class HostMksStore {
     const ranked = recallRank(cands, { ...opts, now, query });
     return { ...ranked, items: ranked.injected, limits: ['fts_only', 'scope_filtered'],
       meta: { ...(ranked.meta || {}), unknown_owner_excluded: !allowUnknown } };
+  }
+  /** O3-14（Host 侧）：recallScoped 之上的 LLM rerank（rerankFn 注入，异步）。
+   *  off / 未注入 rerankFn 时 items 原样（引用不变）；失败回落词法序，检索永不因 rerank 失败。 */
+  async recallScopedRerank(args = {}) {
+    const { rerankFn = null, topN = mksRerankTopN(this.env), enabled = null, ...rest } = args;
+    const base = this.recallScoped(rest);
+    return applyMksRerank({ searched: base, rerankFn, query: rest.query ?? '', topN, enabled: enabled ?? mksRerank(this.env) });
   }
 
   /**
