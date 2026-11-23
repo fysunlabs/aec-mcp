@@ -493,7 +493,7 @@ export function errorReceipt(e) {
 }
 
 export function createMcpV2(kernel, { profile = 'run', endpoint = null, credentialsFile = null, env = process.env, rolesDb = null } = {}) {
-  const server = new McpServer({ name: 'aec-mcp', version: '2.0.0' },
+  const server = new McpServer({ name: 'aec-mcp', version: '2.1.0' },
     { instructions: profile === 'author'
       ? '经验包创作。仅当用户明确要求"用 AEC 做一个经验包/技能"时调用。五阶段，内核按门推进：open（八维需求卡 + 资源需求）→ learn（本库检索，可选）→ plan（HTML 一页：三张图 + 资源表 + 判据表，必须打开给用户看并确认）→ draft（A/D 门，登记草稿）→ 试用（沙箱里跑，不是交付）→ publish（四门 + 用户明确许可）。图示一律用内核给的 HTML 文件展示，不要贴 mermaid 源码。回执第一行的阶段横幅就是当前该做什么、不许做什么。'
       : '经验包下发。仅当用户明确要求"使用/调用 AEC"时调用；其余情况不要调用。op=open 时把用户原话传给 intent。' });
