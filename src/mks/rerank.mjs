@@ -114,4 +114,31 @@ export function mksRerankReady(env = process.env) {
   return mksRerank(env) && !!env.AEC_MKS_RERANK_ENDPOINT && !!env.AEC_MKS_RERANK_MODEL;
 }
 
+/**
+ * 宿主在线工具路径（aec_local.recall）用：从 env 构造 rerankFn。
+ *   - 默认端点 127.0.0.1:17869（本机 sub2api），不主动外联；内核请求路径不调用本函数。
+ *   - 密钥只从 env 读、只进请求头，绝不落盘 / 进日志 / 进回执；回执只带 endpoint_host + model。
+ *   - temperature=0、超时/重试/max_tokens 有界（沿用 createMksRerankFn 默认约束）；
+ *     在线工具路径默认 15s 超时 / 不重试（评测脚本可另设 60s），避免端点故障时长时间挂起；
+ *   - flag 关 → {ok:false,code:'disabled'}，调用方按词法原序返回（逐字节等价）。
+ */
+export function hostRerankFromEnv(env = process.env, fetchFn = null) {
+  if (!mksRerank(env)) return { ok: false, code: 'disabled' };
+  const endpoint = env.AEC_MKS_RERANK_ENDPOINT || 'http://127.0.0.1:17869';
+  const model = env.AEC_MKS_RERANK_MODEL || 'global:hy4flash-free';
+  const apiKey = env.AEC_MKS_RERANK_KEY || null;
+  let endpoint_host;
+  try { endpoint_host = new URL(endpoint).host; }
+  catch { return { ok: false, code: 'invalid_endpoint' }; }
+  const timeoutMs = Number.isFinite(Number(env.AEC_MKS_RERANK_TIMEOUT_MS)) && Number(env.AEC_MKS_RERANK_TIMEOUT_MS) >= 1
+    ? Math.min(Math.floor(Number(env.AEC_MKS_RERANK_TIMEOUT_MS)), 60000) : 15000;
+  const created = createMksRerankFn({
+    endpoint, model, apiKey, fetchFn,
+    limits: { timeout_ms: timeoutMs, max_retries: 0, max_tokens: 700 },
+  });
+  if (!created.ok) return created;
+  return { ok: true, rerankFn: created.rerankFn,
+    meta: { endpoint_host, model, topn: mksRerankTopN(env), timeout_ms: timeoutMs, prompt_version: MKS_RERANK_PROMPT_VERSION } };
+}
+
 export { mksRerankTopN };

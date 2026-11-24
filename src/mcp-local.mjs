@@ -15,8 +15,9 @@ import { z } from 'zod';
 import { statfsSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { warn } from './edge/util.mjs';
-import { localMemoryMode } from './mks/flags.mjs';
+import { localMemoryMode, mksRerank, mksRerankTopN } from './mks/flags.mjs';
 import { resolveHostMksPath } from './mks/store.mjs';
+import { hostRerankFromEnv, applyMksRerank } from './mks/rerank.mjs';
 
 const MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024; // ≥2GB（§5.9）
 
@@ -50,7 +51,17 @@ const fail = (e) => ({ isError: true, content: [{ type: 'text', text: `[aec_loca
  * @param {HostMksStore} store 已按 detectLocalHostMode 构造的 Host MKS 实例
  *        （lite 形态传 null，此时三工具返回明确降级回执，不建库）。
  */
-export function createLocalMcp(store = null, { env = process.env } = {}) {
+export function createLocalMcp(store = null, { env = process.env, rerankFn = undefined, rerankMeta = undefined } = {}) {
+  // O3-14 rerank：仅 recall 工具、仅在 AEC_MKS_RERANK=1 时构造。默认 env 构造；
+  // 测试可注入 rerankFn（确定性、不联网）。密钥只从 env 读、不进任何回执/日志。
+  let _rr = undefined;
+  const rerankCtx = () => {
+    if (_rr !== undefined) return _rr;
+    const built = hostRerankFromEnv(env);
+    _rr = built.ok ? { fn: built.rerankFn, meta: built.meta }
+      : { fn: null, reason: built.code };
+    return _rr;
+  };
   const server = new McpServer({ name: 'aec-mcp-local', version: '2.0.0' }, {
     instructions: '宿主本地语义/记忆面（Host MKS）。任务前 describe+recall 取上下文，任务后 remember 记候选记忆。只读工具不写宿主项目；remember 只写本机 host-mks.sqlite 的 candidate，不直接改用户项目。与公共 aec/aec_author 完全独立。',
   });
@@ -85,6 +96,22 @@ export function createLocalMcp(store = null, { env = process.env } = {}) {
     try {
       const s = needStore();
       const r = s.recall({ query: args.query, kinds: args.kinds || null, opts: args.top_k ? { top_k: args.top_k } : {} });
+      // O3-14：AEC_MKS_RERANK=1 时在 critic 结果上做 LLM 相关性裁决。
+      // rerankFn 缺失 / flag 关 / 失败一律 applied:false + 词法原序，检索永不因 rerank 失败。
+      // 失败原因只透出 code，绝不带 key / endpoint 以外的敏感信息。
+      if (mksRerank(env)) {
+        const ctx = rerankCtx();
+        const fn = rerankFn ?? ctx.fn;
+        const meta = rerankMeta ?? ctx.meta;
+        const rr = await applyMksRerank({ searched: r, rerankFn: fn, query: args.query,
+          topN: mksRerankTopN(env), enabled: true });
+        if (rr.rerank) {
+          delete rr.rerank.usage; // token 用量只记总量于评测证据，工具回执不暴露
+          if (meta) rr.rerank.endpoint_host = meta.endpoint_host;
+          if (ctx.reason && rr.rerank.applied === false && !rr.rerank.reason) rr.rerank.reason = ctx.reason;
+        }
+        return text({ code: 'ok', ...rr });
+      }
       return text({ code: 'ok', ...r });
     } catch (e) { return fail(e); }
   });
