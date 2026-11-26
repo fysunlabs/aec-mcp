@@ -6,7 +6,7 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, rmSync, appendFileSync, renameSync, cpSync } from 'node:fs';
-import { join, resolve, isAbsolute, basename, dirname } from 'node:path';
+import { join, resolve, isAbsolute, basename, dirname, relative } from 'node:path';
 import { now, requireThat } from './util.mjs';
 import { resolveParams, renderArgv, expandTemplate, parseRunIf } from './loop.mjs';
 import { generateRunners, runnerCommand } from './runner.mjs';
@@ -175,6 +175,47 @@ export function materializeOpen({ payload, workspace, execPath = process.execPat
 }
 
 // Close evidence: facts from report.json (process) and a disk scan (truth).
+// Artifact collection: files AND directories (§8.4). produces may declare a
+// directory (e.g. `out-drafts/`, `out-visuals/`); existsSync() is true for dirs,
+// so a bare readFileSync() throws EISDIR and — with no try/catch — aborts the
+// whole close into the "无法自动处理" catch-all. Keep this byte-identical in
+// behavior to aec/src/session.mjs artifactFromPath (two edges must not drift):
+//   file → { path, size, digest }  |  dir → recursive files + aggregate dir
+//   artifact |  read error → { path, missing:true, error:<code> }, never throws.
+// Symlinks are not followed (security: never pull arbitrary host paths in).
+export function artifactFromPath(path) {
+  const sha = bytes => 'sha256:' + createHash('sha256').update(bytes).digest('hex');
+  const missing = e => [{ path, missing: true, ...(e?.code ? { error: e.code } : {}) }];
+  let st;
+  try { st = statSync(path); } catch (e) { return missing(e); }
+  if (!st.isDirectory()) {
+    try { const bytes = readFileSync(path); return [{ path, size: bytes.length, digest: sha(bytes) }]; }
+    catch (e) { return missing(e); }
+  }
+  const out = []; const pieces = [];
+  const walk = dir => {
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const full = join(dir, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (e.isFile()) {
+        try {
+          const bytes = readFileSync(full); const d = sha(bytes);
+          out.push({ path: full, size: bytes.length, digest: d });
+          pieces.push(`${relative(path, full)}:${d}`);
+        } catch { /* 单文件读失败不连累目录，内核侧如实判失败 */ }
+      }
+    }
+  };
+  walk(path);
+  pieces.sort();
+  out.push({ path, kind: 'directory', file_count: out.length,
+    size: out.reduce((s, a) => s + (a.size || 0), 0),
+    digest: 'sha256:' + createHash('sha256').update(pieces.join('\n')).digest('hex') });
+  return out;
+}
+
 export function collectCloseEvidence({ sessionDir, loop }) {
   const report = readJson(join(sessionDir, 'run', 'report.json')) || { steps: [] };
   const state = readJson(join(sessionDir, 'state.json')) || {};
@@ -189,9 +230,7 @@ export function collectCloseEvidence({ sessionDir, loop }) {
       const path = inSession(expandTemplate(produce, bind));
       if (seen.has(path)) continue;
       seen.add(path);
-      if (!existsSync(path)) { artifacts.push({ path, missing: true }); continue; }
-      const bytes = readFileSync(path);
-      artifacts.push({ path, size: bytes.length, digest: 'sha256:' + createHash('sha256').update(bytes).digest('hex') });
+      artifacts.push(...artifactFromPath(path));
     }
   }
   for (const c of loop.checks || []) {

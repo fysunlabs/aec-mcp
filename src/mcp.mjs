@@ -3,8 +3,8 @@
 // through the hardened HTTP transport; only identity + edge file layout lives here.
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
-import { join, basename, resolve, sep } from 'node:path';
+import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, readdirSync } from 'node:fs';
+import { join, basename, resolve, sep, dirname } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { realpathSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
@@ -38,23 +38,123 @@ const subjectResolver = (endpoint) => (_subjectResolver ??= createSubjectResolve
 const readJson = p => { try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; } };
 
 // session → workspace 指针（机器级，§10.1 身份旁）：close/turn 只有 {op,session}，
-// 不带 workspace（§8.1）。正常情况下 MCP 进程 cwd 稳定、两边解析一致；进程换了
-// cwd 或重启后，用这份索引兜底找回现场目录。
+// 不带 workspace（§8.1）。进程换 cwd / 重启后用这份索引兜底找回现场目录。
+// v2 条目 = { v:2, workspace, session_dir, trial_of }；v1 是纯字符串（工作区根
+// 或完整会话目录），locateSession 兼容读取。Windows 反斜杠路径不再用字符串切分。
 const SESSION_INDEX = () => join(defaultIdentityDir(), 'sessions-index.json');
 const indexGet = session => readJson(SESSION_INDEX())?.[session] ?? null;
-const indexPut = (session, workspace) => {
+const normSlashes = p => String(p ?? '').replaceAll('\\', '/');
+const sessionMarker = session => `/.aec/sessions/${session}`;
+export const maskHomePath = (p) => {
+  const s = String(p ?? '');
+  if (!s) return s;
+  const n = normSlashes(s), h = normSlashes(homedir());
+  const eq = (a, b) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+  if (eq(n, h)) return '~';
+  if (n.length > h.length && n[h.length] === '/' && eq(n.slice(0, h.length), h)) return `~${n.slice(h.length)}`;
+  return s;
+};
+export function indexPut(session, entry) {
   try {
     const p = SESSION_INDEX();
-    mkdirSync(join(p, '..'), { recursive: true, mode: 0o700 });
+    mkdirSync(dirname(p), { recursive: true, mode: 0o700 });
     const doc = readJson(p) || {};
-    doc[session] = workspace;
-    writeFileSync(p, JSON.stringify(doc), { mode: 0o600 });
+    doc[session] = entry;                       // 读改写：不丢其它会话键
+    const tmp = `${p}.tmp-${process.pid}-${Date.now()}`;
+    writeFileSync(tmp, JSON.stringify(doc, null, 2), { mode: 0o600 });
+    renameSync(tmp, p);                          // 原子替换：半截 JSON 不再可见
   } catch (e) {
-    // 指针失败不阻断任务，但必须可观测：丢指针意味着进程重启后 close/turn 找不回现场。
     warn(`会话指针写入失败（sessions-index.json）：${e.message} —— 任务继续，进程重启后现场找回将退化为 cwd 推断。`);
   }
-};
-const wsFor = (args) => resolveWorkspace(args.workspace ?? indexGet(args.session) ?? null);
+}
+// 零副作用现场定位：按优先级只读探测 loop.json，绝不调用会 mkdir 的 resolveWorkspace。
+// 命中后从 sessionDir 反推 aecDir / ledgerPath，不再依赖字符串切分推导工作区根。
+export function locateSession(args, { env = process.env, cwd = process.cwd() } = {}) {
+  const session = args?.session;
+  const idx = indexGet(session);
+  const tried = [], candidates = [], archives = [], seen = new Set();
+  const trySessionDir = (label, dir) => {
+    if (typeof dir !== 'string' || !dir) return;
+    const sd = resolve(dir), key = `s:${normSlashes(sd).toLowerCase()}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    const loopPath = join(sd, 'loop.json');
+    tried.push(`${label} → ${maskHomePath(loopPath)}`);
+    if (basename(sd) !== session || !existsSync(loopPath)) return;
+    candidates.push({ label, sessionDir: sd });
+    const marker = sessionMarker(session);
+    if (normSlashes(sd).toLowerCase().endsWith(marker.toLowerCase()))
+      archives.push(resolve(normSlashes(sd).slice(0, -marker.length), '.aec', 'archive', session));
+  };
+  const tryWorkspace = (label, root) => {
+    if (typeof root !== 'string' || !root) return;
+    const r = resolve(root), key = `w:${normSlashes(r).toLowerCase()}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    const sd = join(r, '.aec', 'sessions', session), loopPath = join(sd, 'loop.json');
+    tried.push(`${label} → ${maskHomePath(loopPath)}`);
+    if (existsSync(loopPath)) candidates.push({ label, sessionDir: sd });
+    archives.push(join(r, '.aec', 'archive', session));
+  };
+  // ① 新索引的精确会话目录；② 新索引的工作区根
+  if (idx && typeof idx === 'object') {
+    trySessionDir('索引.session_dir', idx.session_dir);
+    tryWorkspace('索引.workspace', idx.workspace);
+  } else if (typeof idx === 'string' && idx) {
+    // ③ 旧字符串值：反斜杠规范化后按 /.aec/ 切根，或从尾部剥掉 .aec/sessions/<id>
+    const raw = normSlashes(idx), marker = sessionMarker(session);
+    if (raw.toLowerCase().endsWith(marker.toLowerCase())) {
+      trySessionDir('索引旧值(会话目录)', raw);
+      tryWorkspace('索引旧值(剥掉会话段)', raw.slice(0, -marker.length));
+    } else {
+      const cut = raw.split('/.aec/')[0];
+      if (cut !== raw) tryWorkspace('索引旧值(按 /.aec/ 切根)', cut);
+      trySessionDir('索引旧值(原值)', raw);
+      tryWorkspace('索引旧值(按工作区根)', raw);
+    }
+  }
+  // ④ args.workspace：索引标记为试用时忽略（与 open「试用一律沙箱」对称）
+  const trial = !!(idx && typeof idx === 'object' && idx.trial_of)
+    || (typeof idx === 'string' && normSlashes(idx).toLowerCase().includes('/.aec-trials/'));
+  if (args?.workspace && !trial) tryWorkspace('args.workspace', args.workspace);
+  // ⑤ 试用根扫描；⑥ cwd / git root
+  const trialRoot = env.AEC_TRIAL_ROOT || join(homedir(), '.aec-trials');
+  let dirs = [];
+  try { dirs = readdirSync(trialRoot, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => d.name); } catch { /* 根不存在：跳过 */ }
+  for (const name of dirs) tryWorkspace(`试用根扫描(${name})`, join(trialRoot, name));
+  tryWorkspace('cwd', cwd);
+  let dir = cwd;
+  while (dir !== dirname(dir)) {
+    if (existsSync(join(dir, '.git'))) { tryWorkspace('git root', dir); break; }
+    dir = dirname(dir);
+  }
+  if (candidates.length) {
+    const { label, sessionDir } = candidates[0];
+    const sessionsDir = dirname(sessionDir), aecDir = dirname(sessionsDir);
+    return { ok: true, label, sessionDir, sessionsDir, aecDir, ledgerPath: join(aecDir, 'ledger.jsonl'), tried };
+  }
+  return { ok: false, archived: archives.find(p => existsSync(p)) ?? null, tried,
+    index_value: idx == null ? '(无索引条目)' : (typeof idx === 'string' ? maskHomePath(idx)
+      : JSON.stringify(idx, (_k, v) => typeof v === 'string' ? maskHomePath(v) : v)) };
+}
+export function sessionSceneNotFound(args, loc) {
+  const lines = [
+    `[AEC] 会话 ${args.session} 的现场不存在：按下列顺序只读探测，均未找到 loop.json（探测没有创建任何目录）。`,
+    ...loc.tried.map(t => `  · ${t}`),
+    `  索引原值：${loc.index_value}`,
+  ];
+  if (loc.archived) lines.push(`  该会话已 close 并归档：${maskHomePath(loc.archived)}（本次 close 已归档，未删除）。`);
+  else lines.push('  未发现归档目录：现场未找到，如实告诉用户；可重新 open。');
+  return { isError: true, content: [{ type: 'text', text: lines.join('\n') }],
+    structuredContent: { code: 'session_scene_not_found', session: args.session, tried: loc.tried, index_value: loc.index_value, archived: loc.archived ? maskHomePath(loc.archived) : null } };
+}
+// close 成功后把索引条目标记 closed：重复 close 会命中 archive 检查并明确报「已归档」。
+export function markSessionClosed(session, sessionDir) {
+  const marker = sessionMarker(session), norm = normSlashes(sessionDir);
+  const workspace = norm.toLowerCase().endsWith(marker.toLowerCase()) ? resolve(norm.slice(0, -marker.length)) : dirname(dirname(dirname(sessionDir)));
+  const prev = indexGet(session);
+  indexPut(session, { v: 2, workspace, session_dir: sessionDir, trial_of: (prev && typeof prev === 'object' && prev.trial_of) || null, closed: true, closed_at: new Date().toISOString() });
+}
 
 
 // The edge half of the aec/v2 tool. `kernel` is anything with .call(name, args).
@@ -138,7 +238,8 @@ export function aecEdgeHandlers(kernel) {
         return { content: [{ type: 'text', text: markdown }], structuredContent };
       }
       const mat = materializeOpen({ payload, workspace: wsArg });
-      indexPut(payload.session, mat.sessionDir.split('/.aec/')[0]);
+      // 直接写已解析的工作区根与会话目录（不再切字符串：Windows 反斜杠会切断命中失败）。
+      indexPut(payload.session, { v: 2, workspace: ws.root, session_dir: mat.sessionDir, trial_of: args.trial_of ?? null });
       if (sweep.orphan) {
         mat.markdown = `[AEC] 上次有个未完成的会话（${sweep.orphan.age}，${sweep.orphan.steps} 步）——\n      如果用户这次讲的是同一件事，先说一句"上次没跑完，要不要接着做"；否则忽略这句。\n\n${mat.markdown}`;
         mat.structuredContent.orphan = { session: sweep.orphan.session, age: sweep.orphan.age };
@@ -187,10 +288,11 @@ ${cp.markdown}`;
     },
     async close(args) {
       if (!args.session) return { isError: true, content: [{ type: 'text', text: '[AEC] 没有进行中的会话：直接重新 open 即可（open 没建会话的场景——no_match/ambiguous——无需 close）。' }] };
-      const ws = wsFor(args);
-      const sessionDir = join(ws.sessionsDir, args.session);
+      const loc = locateSession(args);
+      if (!loc.ok) return sessionSceneNotFound(args, loc);
+      const { sessionDir, aecDir } = loc;
       const loop = readJson(join(sessionDir, 'loop.json'));
-      if (!loop) return { isError: true, content: [{ type: 'text', text: `[AEC] 会话 ${args.session} 的现场不存在（可能已清理）。如需重做请重新 open。` }] };
+      if (!loop) return sessionSceneNotFound(args, loc); // 探测与读取之间的并发移走
       const evidence = collectCloseEvidence({ sessionDir, loop });
       // W25（§16.4 L0 运行期）：report 里出现命中宿主策略 denied_argv0 的步骤 →
       // host_policy_violated=true → 内核 grade 走 A2 abandoned（安全优先于兼容）。
@@ -199,7 +301,8 @@ ${cp.markdown}`;
       const result = await kernel.call('aec', { op: 'close', session: args.session, status: args.status, evidence, ...(args.acceptance !== undefined ? { acceptance: args.acceptance } : {}) });
       const cleanup = result.cleanup?.removed === null
         ? { removed: null }
-        : edgeCleanup({ sessionDir, ledgerPath: join(ws.aecDir, 'ledger.jsonl'), result: { ...result, ...readJson(join(sessionDir, 'state.json')) } });
+        : edgeCleanup({ sessionDir, ledgerPath: join(aecDir, 'ledger.jsonl'), result: { ...result, ...readJson(join(sessionDir, 'state.json')) } });
+      if (cleanup?.archived) markSessionClosed(args.session, sessionDir);
       const { markdown, structuredContent } = renderClose({
         session: args.session, grade: result.grade, checks: result.checks || [], artifacts: result.artifacts || [], cleanup, reason: result.reason,
         // W16/W18/W23：交付三字段 + 判定原因/上限 + revision（内核 close 输出透传）
@@ -218,10 +321,11 @@ ${cp.markdown}`;
     },
     async turn(args) {
       if (!args.session) return { isError: true, content: [{ type: 'text', text: '[AEC] 缺少会话 id：回执里的"会话 ses_…"就是它，不要自己编。没有会话就先 open。' }] };
-      const ws = wsFor(args);
-      const sessionDir = join(ws.sessionsDir, args.session);
+      const loc = locateSession(args);
+      if (!loc.ok) return sessionSceneNotFound(args, loc);
+      const { sessionDir } = loc;
       const loop = readJson(join(sessionDir, 'loop.json'));
-      if (!loop) return { isError: true, content: [{ type: 'text', text: `[AEC] 会话 ${args.session} 的现场不存在。重新 open。` }] };
+      if (!loop) return sessionSceneNotFound(args, loc);
       const evidence = collectCloseEvidence({ sessionDir, loop });
       // W17：goal_op / assumption_op —— 边端读 goal.json 传入，内核纯函数修订后
       // 原子写回（临时文件 + rename；§21.4"要么旧值要么新值"）。
@@ -289,8 +393,9 @@ ${cp.markdown}`;
     },
     async resource(args) {
       if (!args.session) return { isError: true, content: [{ type: 'text', text: '[AEC] 缺少会话 id：回执里的"会话 ses_…"就是它，不要自己编。' }] };
-      const ws = resolveWorkspace(args.workspace ?? null);
-      const sessionDir = join(ws.sessionsDir, args.session);
+      const loc = locateSession(args);
+      if (!loc.ok) return sessionSceneNotFound(args, loc);
+      const { sessionDir } = loc;
       const result = await kernel.call('aec', { op: 'resource', session: args.session, stage: args.stage, trigger: args.trigger, want: args.want });
       // Materialize delivered files the same way open does (§7.5 path rules).
       const tickets = new Map();
