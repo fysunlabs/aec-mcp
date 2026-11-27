@@ -36,17 +36,13 @@
 
 ### 1. 安装
 
-需要 Node.js **22.5 或更高版本**（无需编译任何原生组件）。
-
-```bash
-npm install -g @fysunlabs/aec-mcp
-```
-
-也可以直接从 GitHub 安装（拉取完整依赖树）：
+需要 Node.js **22.5 或更高版本**（无需编译任何原生组件）。推荐直接从 GitHub 安装（安装 `main` 分支最新发布）：
 
 ```bash
 npm install -g github:fysunlabs/aec-mcp
 ```
+
+> npm registry 同名包 `@fysunlabs/aec-mcp` 暂未发布；执行 `npm install -g @fysunlabs/aec-mcp` 会得到 404。发布后本节会更新——当前请一律使用上面的 GitHub spec 安装。
 
 **从源码安装（开发者）**：注意 npm 对**本地目录**的 `-g` 安装是软链模式，不会复制依赖——
 直接 `npm install -g D:\path\to\aec-mcp` 会安装"成功"但启动即报
