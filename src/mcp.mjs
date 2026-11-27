@@ -887,7 +887,7 @@ export function createMcpV2(kernel, { profile = 'run', endpoint = null, credenti
     server.registerTool('aec_author', {
       description: '经验包创作。仅当用户明确要求"用 AEC 做一个经验包/技能"时调用。五阶段：open（八维需求卡 + 资源需求）→ learn（本库检索）→ plan（HTML 一页：三张图 + 资源表 + 判据表，打开给用户确认）→ draft（A/D 门，登记草稿）→ 试用（沙箱，验证不是交付）→ publish（四门 + 用户许可）。契约较大时把 loop.json 写盘后用 pkg_dir 传路径。图示用 HTML 文件展示，不要贴 mermaid。',
       inputSchema: {
-        op: z.enum(['open', 'learn', 'plan', 'draft', 'publish']),
+        op: z.enum(['open', 'learn', 'plan', 'draft', 'publish', 'ontology']),
         intent: z.string().optional(), session: z.string().optional(),
         // B-20：必须是"有类型的 object"声明。z.unknown() 的 JSON Schema 是 {}（无类型），
         // 宿主对无类型参数会按字符串序列化——真实发生过：整个 loop 变成一段 JSON 文本，
@@ -915,6 +915,19 @@ export function createMcpV2(kernel, { profile = 'run', endpoint = null, credenti
         security_report: z.unknown().optional().describe('ingest：宿主提供的 aec.security-report/v1'),
         candidate: z.unknown().optional().describe('ingest：同 extraction_candidates'),
         visibility: z.string().optional().describe('ingest publish：public|private'),
+        // AEC 5.2（ADR §5.2）：op=ontology 五 action，与内核仓 mcp2 同源。draft 产
+        // candidate 骨架；release/promote 需要用户明确许可（confirm:true 第二遍）。
+        action: z.enum(['draft', 'validate', 'release', 'promote', 'diff']).optional()
+          .describe('op=ontology 必填：draft=从需求卡出 BO 草稿（candidate） validate=纯函数校验（不写库） release=发 BO release（confirm） promote=delta 晋升新 BO release（confirm，不发新包） diff=两版本差异'),
+        business_ontology: z.record(z.unknown()).optional()
+          .describe('op=ontology：完整 aec.business-ontology/v1 文档；pkg_dir 传入时边端自动读 <pkg_dir>/resources/ontology/business.json'),
+        compatibility: z.record(z.unknown()).optional().describe('op=ontology,release 可选：{packages:[{id,version_range}], aec:{…}}'),
+        bo_id: z.string().optional().describe('op=ontology,diff/promote：BO id'),
+        from: z.string().optional().describe('op=ontology,diff：起始版本'),
+        to: z.string().optional().describe('op=ontology,diff：目标版本'),
+        delta_id: z.string().optional().describe('op=ontology,promote：host_delta id（边端从 Host MKS 读出并随 delta_id 带审计）'),
+        delta: z.record(z.unknown()).optional().describe('op=ontology,promote：{base_digest, patch:[RFC6902 子集]}（给 delta_id 时由边端读出，二选一）'),
+        target_version: z.string().optional().describe('op=ontology,promote：新 BO 版本号'),
       },
     }, async args => {
       try {
@@ -926,6 +939,23 @@ export function createMcpV2(kernel, { profile = 'run', endpoint = null, credenti
         const loopPath = join(args.pkg_dir, 'loop.json');
         const text = readFileSync(loopPath, 'utf8');
         loopArg = JSON.parse(text.replace(/^\uFEFF/, '').trim());
+      }
+      // AEC 5.2：op=ontology 的 BO 文档内联（pkg_dir 读 resources/ontology/business.json 或
+      // ontology/business.json，与内核仓 mcp2 同源防漂移）；promote 的 delta 缺省时由
+      // Host MKS 按 delta_id 读出（本边端是唯一持有者）。
+      let boArg = args.business_ontology;
+      if (!boArg && args.pkg_dir && args.op === 'ontology') {
+        for (const p of [join(args.pkg_dir, 'resources', 'ontology', 'business.json'), join(args.pkg_dir, 'ontology', 'business.json')]) {
+          if (existsSync(p)) { boArg = JSON.parse(readFileSync(p, 'utf8').replace(/^\uFEFF/, '').trim()); break; }
+        }
+      }
+      let deltaArg = args.delta;
+      if (!deltaArg && args.delta_id && args.op === 'ontology' && args.action === 'promote') {
+        const store = await (ontologyCtx?.getStore?.() ?? null);
+        const row = store ? store.getHostDelta({ delta_id: args.delta_id }) : null;
+        if (!row) throw Object.assign(new Error(`host_delta_not_found: delta_id ${args.delta_id} 在 Host MKS 里不存在（宿主事实由本边端写入；换目标主机或核对 id）`), { code: 'host_delta_not_found' });
+        deltaArg = { base_digest: row.base_digest, patch: row.patch, evidence: row.evidence ?? undefined };
+        try { store.markHostDelta({ delta_id: args.delta_id, status: 'approved' }); } catch { /* 标记失败不阻断晋升 */ }
       }
       let draftFiles = [];
       if (args.op === 'draft' && args.pkg_dir) {
@@ -942,7 +972,7 @@ export function createMcpV2(kernel, { profile = 'run', endpoint = null, credenti
       // R5-P1-1（R5-G01）：extraction_file 是边端本地路径，远端内核读不到宿主盘——
       // 发送前读取并转成 extraction_candidates，同时删除 extraction_file。
       // 读取/解析失败与本地内核同码 invalid_extraction_file，绝不静默吞掉。
-      const authorArgs = inlineExtractionFile({ ...args, loop: loopArg, ...(args.op === 'draft' ? { files: draftFiles } : {}) });
+      const authorArgs = inlineExtractionFile({ ...args, loop: loopArg, ...(boArg ? { business_ontology: boArg } : {}), ...(deltaArg ? { delta: deltaArg } : {}), ...(args.op === 'draft' ? { files: draftFiles } : {}) });
       const result = await kernel.call('aec_author', authorArgs);
       // 图示落盘：plan/draft 的表格版 HTML 写成本地文件（兼容/降级通道）。
       materializeAuthorHtml(result, args.op);
