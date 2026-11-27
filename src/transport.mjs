@@ -195,7 +195,7 @@ export function createRemoteKernel({ endpoint, profile = 'run', credentialsFile 
     async call(name, args) {
       const op = args.op ?? 'open';
       const isAuthor = name === 'aec_author';
-      const allowed = isAuthor ? ['open', 'learn', 'plan', 'draft', 'publish'] : ['open', 'close', 'turn', 'resource'];
+      const allowed = isAuthor ? ['open', 'learn', 'plan', 'draft', 'publish', 'ontology'] : ['open', 'close', 'turn', 'resource', 'ontology'];
       requireThat(allowed.includes(op), 'invalid_op', `远程内核不支持 ${name} op=${op}`);
       const path = isAuthor ? `/aec/v2/author/${op}` : `/aec/v2/${op}`;
       const cred = credential(); // 无密钥在这里即抛 api_key_required：业务调用之前

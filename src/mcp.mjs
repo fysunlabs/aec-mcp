@@ -334,7 +334,24 @@ ${cp.markdown}`;
           trust: result.trust ?? null,
         },
       });
-      return { content: [{ type: 'text', text: markdown }], structuredContent: { ...structuredContent, package_id: readJson(join(sessionDir, 'state.json'))?.package_id ?? null } };
+      // AEC 5.2 P3-4/P4-1（ADR §6.5）：close 回执的 BO mismatch/delta candidate——
+      // 内核只算 candidate，本边端把它写进 Host MKS（host_delta，status=candidate 等人工 promote），
+      // 并按 binding 状态合并宿主侧状态。旧包/旧会话无 business_ontology 时整段跳过，字节等价。
+      let closeBo = null;
+      if (result.business_ontology) {
+        closeBo = await mergeHostOntologyState(result.business_ontology, { env: process.env, getStore: ontologyCtx?.getStore ?? null });
+        if (Array.isArray(closeBo?.delta_candidate?.patch) && closeBo.delta_candidate.patch.length) {
+          const store = ontologyCtx ? await (ontologyCtx.getStore?.() ?? null) : null;
+          if (store) {
+            try {
+              const d = closeBo.delta_candidate;
+              store.putHostDelta({ bo_id: closeBo.bo_id, base_digest: d.base_digest, patch: d.patch, source: d.source ?? 'run', status: d.status ?? 'candidate' });
+              closeBo.host_delta_written = true;
+            } catch (e) { warn(`[AEC] close host_delta 写入失败（candidate 仍随回执返回）：${e.message}`); }
+          }
+        }
+      }
+      return { content: [{ type: 'text', text: closeBo ? `${markdown}\n\n${renderBoBlock(closeBo)}` : markdown }], structuredContent: { ...structuredContent, ...(closeBo ? { business_ontology: closeBo } : {}), package_id: readJson(join(sessionDir, 'state.json'))?.package_id ?? null } };
     },
     async turn(args) {
       if (!args.session) return { isError: true, content: [{ type: 'text', text: '[AEC] 缺少会话 id：回执里的"会话 ses_…"就是它，不要自己编。没有会话就先 open。' }] };
