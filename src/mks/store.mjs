@@ -27,6 +27,11 @@ import { verifySignature } from './federation-sign.mjs';
 
 export const HOST_MKS_SCHEMA = 'aec-mcp.host-mks/v1';
 export const BUNDLE_VERSION = '1';
+// AEC 5.2：BO 事实来源词表（与内核 aec/src/contracts/business-ontology.mjs BO_FACT_SOURCES 对齐）。
+export const BO_FACT_SOURCES = ['user', 'material', 'probe', 'memory', 'knowledge', 'run', 'inference'];
+
+const stable = v => JSON.stringify(v ?? null);
+const factRow = r => ({ ...r, value: pj(r.value_json), value_json: undefined });
 
 /** Host MKS 库路径：与 roles.sqlite 同基础目录但不同文件（节点独立，不复用）。 */
 export function resolveHostMksPath({ env = process.env, explicit = null } = {}) {
@@ -170,6 +175,63 @@ const HOST_MIGRATIONS = [
         helped INTEGER NOT NULL DEFAULT 0, hurt INTEGER NOT NULL DEFAULT 0,
         created_at TEXT, updated_at TEXT,
         PRIMARY KEY(origin_node, guidance_id, updated_at));
+    `,
+  },
+  {
+    // host-mks/v3（AEC 5.2，ADR-AEC-三平面本体-v2 §4.4，计划 P3-1）：
+    //   host_fact / host_binding / host_delta / host_observation —— BO 驱动的按需事实。
+    // 硬约束：只加不改 + IF NOT EXISTS 可重入；本地不存明文 secrets（敏感槽位只存
+    // value_ref，写入侧拒绝明文）；事实信封带 source/observed_at/confidence/valid_until/status。
+    // host_delta.base_digest 必须等于当前解析 BO digest（BO 变更后旧 delta 标 superseded）。
+    version: 3,
+    description: 'host-mks/v3 (AEC 5.2): BO-driven host facts (fact/binding/delta/observation), TTL + audit',
+    sql: `
+      CREATE TABLE IF NOT EXISTS host_fact(
+        fact_id TEXT PRIMARY KEY,
+        package_id TEXT, bo_id TEXT, bo_version TEXT, bo_digest TEXT,
+        path TEXT NOT NULL,
+        value_json TEXT NOT NULL,
+        source TEXT NOT NULL,
+        ref TEXT,
+        observed_at TEXT NOT NULL,
+        confidence REAL NOT NULL DEFAULT 0.5,
+        valid_until TEXT,
+        status TEXT NOT NULL DEFAULT 'observed',
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        UNIQUE(bo_id, bo_digest, path));
+      CREATE INDEX IF NOT EXISTS idx_host_fact_bo ON host_fact(bo_id, bo_digest, status);
+
+      CREATE TABLE IF NOT EXISTS host_binding(
+        binding_id TEXT PRIMARY KEY,
+        package_id TEXT, bo_id TEXT, bo_version TEXT, bo_digest TEXT,
+        slot TEXT NOT NULL,
+        value_ref TEXT,
+        source TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'unbound',
+        updated_at TEXT NOT NULL,
+        UNIQUE(bo_id, bo_digest, slot));
+
+      CREATE TABLE IF NOT EXISTS host_delta(
+        delta_id TEXT PRIMARY KEY,
+        bo_id TEXT NOT NULL,
+        base_digest TEXT NOT NULL,
+        patch_json TEXT NOT NULL,
+        source TEXT NOT NULL,
+        evidence_json TEXT,
+        status TEXT NOT NULL DEFAULT 'candidate',
+        approved_by TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS idx_host_delta_bo ON host_delta(bo_id, status);
+
+      CREATE TABLE IF NOT EXISTS host_observation(
+        observation_id TEXT PRIMARY KEY,
+        package_id TEXT, bo_id TEXT, bo_version TEXT, bo_digest TEXT,
+        path TEXT NOT NULL, value_json TEXT NOT NULL,
+        source TEXT NOT NULL, observed_at TEXT NOT NULL,
+        confidence REAL NOT NULL DEFAULT 0.5,
+        status TEXT NOT NULL DEFAULT 'unmodeled',
+        created_at TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS idx_host_observation_bo ON host_observation(bo_id, status);
     `,
   },
 ];
@@ -836,6 +898,160 @@ export class HostMksStore {
     return this.db.prepare(`SELECT * FROM host_federation_log WHERE ${where.join(' AND ')} ORDER BY at, rowid DESC LIMIT ?`).all(...args);
   }
 
+  // --- AEC 5.2：BO 驱动的宿主事实（host_fact/binding/delta/observation，v3） -------
+  // 铁律：本类只在 aec-mcp 边端执行；内核永不写宿主库（ADR §3.3）。
+  // 敏感槽位只存 value_ref；明文命中由内核分类层拒绝（host-ops），这里再兜一道。
+
+  putHostFact({ package_id = null, bo_id, bo_version = null, bo_digest = null, path, value, value_ref = null, source = 'run', observed_at = null, confidence = 0.5, valid_until = null, status = 'observed' } = {}) {
+    require2(bo_id && path, 'host_fact_required', 'bo_id/path 必填');
+    require2(BO_FACT_SOURCES.includes(source), 'host_source_invalid', `source 必须是 ${BO_FACT_SOURCES.join('|')}`);
+    const vj = stable(value);
+    const existing = this.db.prepare('SELECT fact_id FROM host_fact WHERE bo_id=? AND bo_digest=? AND path=?').get(bo_id, bo_digest, path);
+    const at = nowIso();
+    if (existing) {
+      this.db.prepare(
+        `UPDATE host_fact SET package_id=?, bo_version=?, value_json=?, source=?, ref=?, observed_at=?, confidence=?, valid_until=?, status=?, updated_at=? WHERE fact_id=?`
+      ).run(package_id, bo_version, vj, source, value_ref, observed_at ?? at, confidence, valid_until, status, at, existing.fact_id);
+      this._audit({ action: 'host.fact.put', target: `${bo_id}:${path}` });
+      return this.getHostFact({ bo_id, bo_digest, path });
+    }
+    const fact_id = randomUUID();
+    this.db.prepare(
+      `INSERT INTO host_fact(fact_id,package_id,bo_id,bo_version,bo_digest,path,value_json,source,ref,observed_at,confidence,valid_until,status,created_at,updated_at)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).run(fact_id, package_id, bo_id, bo_version, bo_digest, path, vj, source, value_ref, observed_at ?? at, confidence, valid_until, status, at, at);
+    this._audit({ action: 'host.fact.put', target: `${bo_id}:${path}` });
+    return this.getHostFact({ bo_id, bo_digest, path });
+  }
+  getHostFact({ bo_id, bo_digest, path }) {
+    const r = this.db.prepare('SELECT * FROM host_fact WHERE bo_id=? AND bo_digest=? AND path=?').get(bo_id, bo_digest, path);
+    return r ? factRow(r) : null;
+  }
+  listHostFacts({ bo_id, bo_digest = null, status = null, limit = 200 } = {}) {
+    const where = ['bo_id = ?']; const args = [bo_id];
+    if (bo_digest) { where.push('bo_digest = ?'); args.push(bo_digest); }
+    if (status) { where.push('status = ?'); args.push(status); }
+    return this.db.prepare(`SELECT * FROM host_fact WHERE ${where.join(' AND ')} ORDER BY path LIMIT ?`).all(...args, limit).map(factRow);
+  }
+  // TTL：valid_until 过去时 → status='stale'（不删行；stale 不参与决策）。
+  expireHostFacts({ bo_id = null, now = Date.now() } = {}) {
+    const at = nowIso();
+    const cutoff = new Date(now).toISOString();
+    const r = bo_id
+      ? this.db.prepare("UPDATE host_fact SET status='stale', updated_at=? WHERE bo_id=? AND valid_until IS NOT NULL AND valid_until < ? AND status='observed'").run(at, bo_id, cutoff)
+      : this.db.prepare("UPDATE host_fact SET status='stale', updated_at=? WHERE valid_until IS NOT NULL AND valid_until < ? AND status='observed'").run(at, cutoff);
+    return r.changes;
+  }
+
+  putHostBinding({ package_id = null, bo_id, bo_version = null, bo_digest = null, slot, value_ref = null, source = 'user', status = 'bound' } = {}) {
+    require2(bo_id && slot, 'host_binding_required', 'bo_id/slot 必填');
+    const existing = this.db.prepare('SELECT binding_id FROM host_binding WHERE bo_id=? AND bo_digest=? AND slot=?').get(bo_id, bo_digest, slot);
+    const at = nowIso();
+    if (existing) {
+      this.db.prepare('UPDATE host_binding SET package_id=?, bo_version=?, value_ref=?, source=?, status=?, updated_at=? WHERE binding_id=?')
+        .run(package_id, bo_version, value_ref, source, status, at, existing.binding_id);
+      this._audit({ action: 'host.binding.put', target: `${bo_id}:${slot}` });
+      return this.getHostBinding({ bo_id, bo_digest, slot });
+    }
+    const binding_id = randomUUID();
+    this.db.prepare(
+      'INSERT INTO host_binding(binding_id,package_id,bo_id,bo_version,bo_digest,slot,value_ref,source,status,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)'
+    ).run(binding_id, package_id, bo_id, bo_version, bo_digest, slot, value_ref, source, status, at);
+    this._audit({ action: 'host.binding.put', target: `${bo_id}:${slot}` });
+    return this.getHostBinding({ bo_id, bo_digest, slot });
+  }
+  getHostBinding({ bo_id, bo_digest, slot }) {
+    return this.db.prepare('SELECT * FROM host_binding WHERE bo_id=? AND bo_digest=? AND slot=?').get(bo_id, bo_digest, slot) ?? null;
+  }
+  listHostBindings({ bo_id, bo_digest = null, status = null } = {}) {
+    const where = ['bo_id = ?']; const args = [bo_id];
+    if (bo_digest) { where.push('bo_digest = ?'); args.push(bo_digest); }
+    if (status) { where.push('status = ?'); args.push(status); }
+    return this.db.prepare(`SELECT * FROM host_binding WHERE ${where.join(' AND ')} ORDER BY slot`).all(...args);
+  }
+
+  putHostDelta({ bo_id, base_digest, patch, source = 'run', evidence = null, status = 'candidate', delta_id = null } = {}) {
+    require2(bo_id && base_digest && Array.isArray(patch) && patch.length, 'host_delta_required', 'bo_id/base_digest/patch 必填');
+    // 版本约束（§4.4）：base_digest 必须等于当前解析的 BO digest —— 这里无法查云端，
+    // 由内核分类层保证；本地再拒一次「对旧 base 重复 open candidate」以外的静默覆盖。
+    const id = delta_id ?? randomUUID();
+    const at = nowIso();
+    const existing = this.db.prepare('SELECT delta_id, status FROM host_delta WHERE delta_id=?').get(id);
+    if (existing) {
+      if (existing.status === 'promoted' || existing.status === 'superseded') return this.getHostDelta({ delta_id: id });
+      this.db.prepare('UPDATE host_delta SET patch_json=?, source=?, evidence_json=?, status=?, updated_at=? WHERE delta_id=?')
+        .run(stable(patch), source, evidence ? stable(evidence) : null, status, at, id);
+      return this.getHostDelta({ delta_id: id });
+    }
+    this.db.prepare(
+      'INSERT INTO host_delta(delta_id,bo_id,base_digest,patch_json,source,evidence_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)'
+    ).run(id, bo_id, base_digest, stable(patch), source, evidence ? stable(evidence) : null, status, at, at);
+    this._audit({ action: 'host.delta.put', target: `${bo_id}:${id.slice(0, 12)}` });
+    return this.getHostDelta({ delta_id: id });
+  }
+  getHostDelta({ delta_id }) {
+    const r = this.db.prepare('SELECT * FROM host_delta WHERE delta_id=?').get(delta_id);
+    return r ? { ...r, patch: JSON.parse(r.patch_json ?? '[]'), evidence: r.evidence_json ? JSON.parse(r.evidence_json) : null, patch_json: undefined, evidence_json: undefined } : null;
+  }
+  listHostDeltas({ bo_id, status = null, limit = 100 } = {}) {
+    const where = ['bo_id = ?']; const args = [bo_id];
+    if (status) { where.push('status = ?'); args.push(status); }
+    return this.db.prepare(`SELECT * FROM host_delta WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT ?`).all(...args, limit)
+      .map(r => ({ ...r, patch: JSON.parse(r.patch_json ?? '[]'), patch_json: undefined }));
+  }
+  markHostDelta({ delta_id, status, approved_by = null } = {}) {
+    require2(['candidate', 'approved', 'rejected', 'promoted', 'superseded'].includes(status), 'host_delta_status_invalid', `status 必须是 candidate|approved|rejected|promoted|superseded`);
+    this.db.prepare('UPDATE host_delta SET status=?, approved_by=COALESCE(?, approved_by), updated_at=? WHERE delta_id=?').run(status, approved_by, nowIso(), delta_id);
+    this._audit({ action: 'host.delta.mark', target: `${delta_id}:${status}` });
+    return this.getHostDelta({ delta_id });
+  }
+  // BO release 变化后：旧 base 的未决 delta 全部 superseded（§4.4 版本约束）。
+  supersedeHostDeltas({ bo_id, base_digest, except_delta_id = null } = {}) {
+    const rows = this.db.prepare("SELECT delta_id FROM host_delta WHERE bo_id=? AND base_digest=? AND status IN ('candidate','approved')").all(bo_id, base_digest);
+    let n = 0;
+    for (const r of rows) {
+      if (except_delta_id && r.delta_id === except_delta_id) continue;
+      this.markHostDelta({ delta_id: r.delta_id, status: 'superseded' });
+      n++;
+    }
+    return n;
+  }
+
+  putHostObservation({ package_id = null, bo_id, bo_version = null, bo_digest = null, path, value, source = 'run', observed_at = null, confidence = 0.5, status = 'unmodeled', observation_id = null } = {}) {
+    require2(bo_id && path, 'host_observation_required', 'bo_id/path 必填');
+    const id = observation_id ?? randomUUID();
+    const at = nowIso();
+    const existing = this.db.prepare('SELECT observation_id FROM host_observation WHERE observation_id=?').get(id);
+    if (existing) {
+      this.db.prepare('UPDATE host_observation SET value_json=?, source=?, observed_at=?, confidence=?, status=? WHERE observation_id=?')
+        .run(stable(value), source, observed_at ?? at, confidence, status, id);
+      return this.getHostObservation({ observation_id: id });
+    }
+    this.db.prepare(
+      'INSERT INTO host_observation(observation_id,package_id,bo_id,bo_version,bo_digest,path,value_json,source,observed_at,confidence,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'
+    ).run(id, package_id, bo_id, bo_version, bo_digest, path, stable(value), source, observed_at ?? at, confidence, status, at);
+    this._audit({ action: 'host.observation.put', target: `${bo_id}:${path}` });
+    return this.getHostObservation({ observation_id: id });
+  }
+  getHostObservation({ observation_id }) {
+    const r = this.db.prepare('SELECT * FROM host_observation WHERE observation_id=?').get(observation_id);
+    return r ? { ...r, value: JSON.parse(r.value_json ?? 'null'), value_json: undefined } : null;
+  }
+  listHostObservations({ bo_id, status = 'unmodeled', limit = 100 } = {}) {
+    const where = ['bo_id = ?']; const args = [bo_id];
+    if (status) { where.push('status = ?'); args.push(status); }
+    return this.db.prepare(`SELECT * FROM host_observation WHERE ${where.join(' AND ')} ORDER BY observed_at DESC LIMIT ?`).all(...args, limit)
+      .map(r => ({ ...r, value: JSON.parse(r.value_json ?? 'null'), value_json: undefined }));
+  }
+
+  statusV2Counts() {
+    const c = t => this.db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get().n;
+    return {
+      host_fact: c('host_fact'), host_binding: c('host_binding'),
+      host_delta: c('host_delta'), host_observation: c('host_observation'),
+    };
+  }
+
   // --- purge / rebuild（卸载与维护命令的数据面；CLI 只在此之上包壳） -----------------
   purge() {
     const counts = {};
@@ -845,6 +1061,7 @@ export class HostMksStore {
       package_element: 'host_package_element', business_term: 'host_business_term',
       ontology: 'host_ontology', ontology_mapping: 'host_ontology_mapping',
       local_outbox: 'local_outbox', audit: 'host_audit', federation_log: 'host_federation_log',
+      host_fact: 'host_fact', host_binding: 'host_binding', host_delta: 'host_delta', host_observation: 'host_observation',
     })) {
       counts[key] = this.db.prepare(`DELETE FROM ${t}`).run().changes;
     }

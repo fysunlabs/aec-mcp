@@ -29,7 +29,7 @@ test('node 形态：独立 host-mks.sqlite 迁移到位；roles.sqlite 零触碰
   const mks = new HostMksStore({ path: hostPath, env: envNode });
   try {
     const v = mks.db.prepare('PRAGMA user_version').get().user_version;
-    assert.equal(v, 2, 'Host MKS 独立迁移版本号（5.1 O1 v2：scope_link/thread/episode/preference/retrieval_event/package_guidance；与内核 v1–v21 无关）');
+    assert.equal(v, 3, 'Host MKS 独立迁移版本号（5.1 O1 v2 → 5.2 v3：host_fact/binding/delta/observation；与内核 v1–v26 无关）');
     const names = new Set(mks.db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','view')").all().map(r => r.name));
     for (const t of ['host_memory', 'host_document', 'host_chunk', 'host_claim', 'host_element',
       'host_package_element', 'host_business_term', 'host_ontology', 'local_outbox',
@@ -145,7 +145,8 @@ test('purge/rebuild：清空全部 host_* 表但保留 schema；FTS 可重建', 
     assert.ok(purged.memory >= 1 && purged.business_term >= 1 && purged.local_outbox >= 1);
     assert.equal(mks.listMemories({}).length, 0);
     assert.equal(mks.listBusinessTerms({}).length, 0);
-    assert.equal(mks.db.prepare('PRAGMA user_version').get().user_version, 2, 'schema 保留（5.1 O1 迁移 v2）');
+    assert.equal(mks.db.prepare('PRAGMA user_version').get().user_version, 3, 'schema 保留（5.1 O1 v2 → 5.2 v3）');
+    assert.deepEqual(mks.statusV2Counts(), { host_fact: 0, host_binding: 0, host_delta: 0, host_observation: 0 }, 'v3 四表同被清空且保留');
     // 重建 FTS：重建后可再次命中
     const m = mks.putMemory({ kind: 'business', title: '重建检查', summary: '重建后部署可命中' });
     mks.rebuildFts();

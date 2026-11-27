@@ -10,7 +10,7 @@ const env = { AEC_MCP_LOCAL_MEMORY: 'node', AEC_MCP_NODE_ID: 'host:mig-v2' };
 const V2_TABLES = ['host_scope_link', 'host_thread', 'host_episode', 'host_preference',
   'host_memory_retrieval_event', 'host_package_guidance'];
 
-test('migrate v1→v2：只加 6 张表，旧 host_memory 数据保留，user_version=2', () => {
+test('migrate v1→v2→v3：v2 只加 6 张表，v3 只加 4 张 host_* 本体表，旧数据保留，user_version=3', () => {
   const dir = mkdtempSync(join(tmpdir(), 'hmig2-'));
   const store = new HostMksStore({ path: join(dir, 'h.sqlite'), env });
   try {
@@ -18,7 +18,7 @@ test('migrate v1→v2：只加 6 张表，旧 host_memory 数据保留，user_ve
     store.db.prepare('INSERT INTO host_memory(memory_id,kind,scope,title,summary,content_json,confidence,status,source_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
       .run('legacy-1', 'semantic', 'tenant', '旧记忆', '无归属旧数据', '{}', 0.5, 'verified', '{}', new Date().toISOString(), new Date().toISOString());
     const before = store.db.prepare('SELECT count(*) c FROM host_memory').get().c;
-    assert.equal(store.migration.to, 2);
+    assert.equal(store.migration.to, 3);
 
     for (const t of V2_TABLES) {
       const row = store.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(t);
@@ -49,8 +49,8 @@ test('迁移可重入：重复 migrate 无新步骤，数据不变', () => {
   const s2 = new HostMksStore({ path: dbPath, env });
   try {
     assert.equal(s2.migration.applied.length, 0, '第二次构造无新迁移');
-    assert.equal(s2.migration.from, 2);
-    assert.equal(s2.migration.to, 2);
+    assert.equal(s2.migration.from, 3);
+    assert.equal(s2.migration.to, 3);
   } finally { s2.close(); }
 });
 

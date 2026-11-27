@@ -162,7 +162,9 @@ export function markSessionClosed(session, sessionDir) {
 // The edge half of the aec/v2 tool. `kernel` is anything with .call(name, args).
 // 密钥模式（2026-11-19）：身份由传输层的 Bearer api_key 承载（内核从身份强制注入
 // host_id/tenant），边端不再传 host_id，也不再持有 identity 回调。
-export function aecEdgeHandlers(kernel) {
+// AEC 5.2（ADR §5.3）：第二参 ontologyCtx 由 createMcpV2 注入 —— { env, getStore }，
+// getStore 返回 HostMksStore（lite/关闭时 null）。它是 op=ontology 宿主写入的唯一通道。
+export function aecEdgeHandlers(kernel, ontologyCtx = null) {
   return {
     async open(args) {
       // 试用沙箱（2026-11-09 根因③）：试用是"验证循环能不能跑通"，不是"替用户
@@ -286,6 +288,15 @@ ${cp.markdown}`;
           mat.structuredContent.knowledge = kr.structured;
         }
       }
+      // AEC 5.2（ADR §6.4）：BO 摘要的宿主侧合并——binding 状态（bound/unknown/stale）
+      // 只有 Host MKS 知道。payload 无 business_ontology（旧包）时整段跳过，字节等价。
+      if (payload.business_ontology) {
+        const merged = await mergeHostOntologyState(payload.business_ontology, { env: process.env, getStore: ontologyCtx?.getStore ?? null });
+        if (merged) {
+          mat.structuredContent.business_ontology = merged;
+          mat.markdown = `${mat.markdown}\n\n${renderBoBlock(merged)}`;
+        }
+      }
       return { content: [{ type: 'text', text: mat.markdown }], structuredContent: mat.structuredContent };
     },
     async close(args) {
@@ -296,6 +307,10 @@ ${cp.markdown}`;
       const loop = readJson(join(sessionDir, 'loop.json'));
       if (!loop) return sessionSceneNotFound(args, loc); // 探测与读取之间的并发移走
       const evidence = collectCloseEvidence({ sessionDir, loop });
+      // AEC 5.2（ADR §6.5）：op=ontology 期间的会话本体缓冲 → close 交给内核算
+      // mismatch/delta candidate（buildCloseOntology 只读它；宿主库写入只有 observe/bind 路径）。
+      const ontologyBuf = readOntologyBuffer(sessionDir);
+      if (ontologyBuf) evidence.ontology = { mismatches: ontologyBuf.mismatches ?? [], facts: ontologyBuf.facts ?? [] };
       // W25（§16.4 L0 运行期）：report 里出现命中宿主策略 denied_argv0 的步骤 →
       // host_policy_violated=true → 内核 grade 走 A2 abandoned（安全优先于兼容）。
       const l0Violation = detectPolicyViolation(evidence.report, hostPolicyFromEnv());
@@ -425,7 +440,179 @@ ${cp.markdown}`;
       ].join('\n');
       return { content: [{ type: 'text', text: markdown }], structuredContent: { v: 'aec/v2', session: args.session, files: list, api: apiList } };
     },
+    // AEC 5.2（ADR §5.3）：op=ontology —— 内核只分类（BO 解析/事实分类/绑定校验），
+    // 本边端执行 host_writes（host_fact/host_binding/host_delta/host_observation，
+    // Host MKS 是唯一持有者）。observe/bind 同时缓冲到会话 ontology.json，
+    // close 时作为 evidence.ontology 交给内核算 mismatch/delta。
+    async ontology(args) {
+      const action = args.action ?? 'get';
+      if (!args.session) return { isError: true, content: [{ type: 'text', text: '[AEC] 缺少会话 id：先 open，回执里的"会话 ses_…"就是它。' }] };
+      const loc = locateSession(args);
+      if (!loc.ok) return sessionSceneNotFound(args, loc);
+      const { sessionDir } = loc;
+      const result = await kernel.call('aec', {
+        op: 'ontology', action, session: args.session,
+        ...(action === 'get' ? { sections: args.sections ?? null } : {}),
+        ...(action === 'observe' ? { facts: args.facts ?? [] } : {}),
+        ...(action === 'bind' ? { slot: args.slot, value_ref: args.value_ref, source: args.source ?? null } : {}),
+      });
+      const bo = result.bo ?? {};
+      const store = ontologyCtx ? await (ontologyCtx.getStore?.() ?? null) : null;
+      const hostApplied = { facts: 0, observations: 0, deltas: 0, bindings: 0 };
+      let hostState = null;
+      if (store) {
+        try {
+          for (const f of result.host_writes?.facts ?? []) {
+            store.putHostFact({ package_id: statePackageId(sessionDir), bo_id: bo.bo_id, bo_version: bo.version, bo_digest: bo.digest, path: f.path, value: f.value ?? null, value_ref: f.value_ref ?? null, source: f.source, observed_at: f.observed_at ?? null, confidence: f.confidence ?? 0.5, valid_until: f.valid_until ?? null, status: 'observed' });
+            hostApplied.facts++;
+          }
+          for (const o of result.host_writes?.observations ?? []) {
+            store.putHostObservation({ package_id: statePackageId(sessionDir), bo_id: bo.bo_id, bo_version: bo.version, bo_digest: bo.digest, path: o.path, value: o.value ?? o.value_ref ?? null, source: o.source, observed_at: o.observed_at ?? null, confidence: o.confidence ?? 0.5, status: 'unmodeled' });
+            hostApplied.observations++;
+          }
+          for (const d of result.host_writes?.deltas ?? []) {
+            store.putHostDelta({ bo_id: bo.bo_id, base_digest: d.base_digest, patch: d.patch, source: d.source ?? 'run', status: d.status ?? 'candidate' });
+            hostApplied.deltas++;
+          }
+          for (const b of result.host_writes?.bindings ?? []) {
+            store.putHostBinding({ package_id: statePackageId(sessionDir), bo_id: bo.bo_id, bo_version: bo.version, bo_digest: bo.digest, slot: b.slot, value_ref: b.value_ref, source: b.source ?? 'user', status: 'bound' });
+            hostApplied.bindings++;
+          }
+          // op=ontology,get：按 host_merge_hint 在边端合并宿主状态（bound/unknown/stale）。
+          hostState = hostOntologyState(store, bo, action);
+        } catch (e) {
+          warn(`[AEC] op=ontology 宿主写入失败（内核分类结果已回，不阻断）：${e.message}`);
+        }
+      }
+      // 会话本体缓冲：close → evidence.ontology（内核 buildCloseOntology 只读）。
+      if (result.code === undefined && (action === 'observe' || action === 'bind')) bufferOntology({ sessionDir, action, result });
+      const markdown = renderOntologyReceipt({ action, result, hostApplied, hostState });
+      return { content: [{ type: 'text', text: markdown }], structuredContent: { v: 'aec/v2', ...result, ...(hostState ? { host_state: hostState } : {}), host_applied: hostApplied } };
+    },
   };
+}
+
+// ---- AEC 5.2（ADR §4.4/§5.3）：op=ontology 边端辅助 -------------------------------
+// Host MKS 写入只发生在这几个函数里；内核永不写宿主库。lite 形态 store=null → 全部跳过，
+// 内核回执原样透传（AEC_ONTOLOGY=0 时内核直接回 ontology_disabled）。
+
+// open 回执的宿主侧合并（ADR §6.4）：binding 状态只有 Host MKS 知道。store 缺席时原样透传。
+export async function mergeHostOntologyState(summary, { getStore = null } = {}) {
+  if (!summary || typeof summary !== 'object' || !summary.bo_id) return summary;
+  let store = null;
+  try { store = getStore ? await getStore() : null; } catch { store = null; }
+  if (!store) return summary;
+  try {
+    const bindings = store.listHostBindings({ bo_id: summary.bo_id, bo_digest: summary.digest ?? null });
+    const facts = store.listHostFacts({ bo_id: summary.bo_id, bo_digest: summary.digest ?? null });
+    return {
+      ...summary,
+      bindings_bound: bindings.filter(b => b.status === 'bound').map(b => ({ slot: b.slot, value_ref: b.value_ref, source: b.source })),
+      host_facts: facts.filter(f => f.status !== 'stale').length,
+      host_facts_stale: facts.filter(f => f.status === 'stale').length,
+    };
+  } catch { return summary; }
+}
+
+export function renderBoBlock(bo) {
+  if (!bo || typeof bo !== 'object') return '';
+  const lines = [`【业务本体】BO ${bo.bo_id ?? '?'}@${bo.resolved_version ?? '?'}${bo.digest ? `（digest ${String(bo.digest).slice(0, 12)}…）` : ''}`];
+  lines.push(`- 解析：${bo.resolution ?? '?'}${bo.requested_range && bo.resolution !== 'locked' ? `（请求 ${bo.requested_range}）` : ''}${bo.fallback_reason ? `，回退：${bo.fallback_reason}` : ''}`);
+  lines.push(`- 目标 ${bo.goals ?? 0} 个；绑定声明 ${bo.bindings_declared ?? 0}（敏感 ${bo.bindings_sensitive ?? 0}）${Array.isArray(bo.bindings_bound) && bo.bindings_bound.length ? `；宿主已绑 ${bo.bindings_bound.length}` : ''}`);
+  for (const b of bo.bindings_bound ?? []) lines.push(`  · ${b.slot} ← ${b.value_ref}（${b.source}）`);
+  lines.push('- 本会话事实上报用 op=ontology,observe（未知路径进 unmodeled）；槽位绑定用 op=ontology,bind（只存引用）。');
+  lines.push('- 业务语义变更只提 delta candidate，人工确认后 promote；不要直接改已发布 BO。');
+  return lines.join('\n');
+}
+
+function statePackageId(sessionDir) {
+  try { return JSON.parse(readFileSync(join(sessionDir, 'state.json'), 'utf8'))?.package_id ?? null; } catch { return null; }
+}
+
+function ontologyBufferPath(sessionDir) { return join(sessionDir, 'ontology.json'); }
+
+function readOntologyBuffer(sessionDir) {
+  try { return JSON.parse(readFileSync(ontologyBufferPath(sessionDir), 'utf8')) ?? null; } catch { return null; }
+}
+
+// observe/bind 的会话内累积：facts=accepted+delta（close 时内核对语义路径再核一遍），
+// mismatches=①同 path 值变化（declared→observed）②语义路径观测（声明值未变也算 mismatch）。
+function bufferOntology({ sessionDir, action, result }) {
+  const buf = readOntologyBuffer(sessionDir) ?? { v: 'aec/v2', bo_id: null, digest: null, facts: [], mismatches: [], bindings: [] };
+  const bo = result.bo ?? {};
+  buf.bo_id = bo.bo_id ?? buf.bo_id;
+  buf.digest = bo.digest ?? buf.digest;
+  if (action === 'observe') {
+    const seen = new Map(buf.facts.filter(f => f.value_ref == null).map(f => [f.path, f]));
+    for (const f of [...(result.accepted ?? []), ...(result.deltas ?? [])]) {
+      const prev = seen.get(f.path);
+      if (prev) {
+        const prevV = prev.value ?? prev.value_ref ?? null;
+        const curV = f.value ?? f.value_ref ?? null;
+        if (JSON.stringify(prevV) !== JSON.stringify(curV))
+          buf.mismatches.push({ path: f.path, declared: prevV, observed: curV, source: f.source ?? 'run' });
+      } else seen.set(f.path, f);
+      buf.facts.push(f);
+    }
+    // 语义路径观测：值进 close 后由内核 isSemanticPath 判定并出 delta candidate。
+    for (const f of result.deltas ?? [])
+      buf.mismatches.push({ path: f.path, declared: null, observed: f.value ?? f.value_ref ?? null, note: 'semantic_path' });
+  } else {
+    const b = result.bound ?? null;
+    if (b) buf.bindings.push({ slot: b.slot, value_ref: b.value_ref, source: b.source ?? 'user', at: new Date().toISOString() });
+  }
+  writeFileSync(ontologyBufferPath(sessionDir), JSON.stringify(buf, null, 2), { mode: 0o600 });
+}
+
+// host_merge_hint 的边端实现：只读当前 bo_digest；旧 digest 事实不计入（内核标 stale 的约定由
+// 查询条件承担）；binding 状态 = 声明槽位里的 bound/unknown。
+function hostOntologyState(store, bo, action) {
+  if (!bo?.bo_id) return null;
+  const bindings = store.listHostBindings({ bo_id: bo.bo_id, bo_digest: bo.digest ?? null });
+  const facts = store.listHostFacts({ bo_id: bo.bo_id, bo_digest: bo.digest ?? null });
+  const boundBySlot = new Map(bindings.filter(b => b.status === 'bound').map(b => [b.slot, b]));
+  const declared = action === 'get' && Array.isArray(bo.sections?.bindings) ? bo.sections.bindings.map(b => b.slot) : null;
+  const merged = {
+    bindings: bindings.filter(b => b.status === 'bound').map(b => ({ slot: b.slot, value_ref: b.value_ref, source: b.source })),
+    host_facts: facts.filter(f => f.status !== 'stale').length,
+    host_facts_stale: facts.filter(f => f.status === 'stale').length,
+  };
+  if (declared) merged.declared_unknown = declared.filter(s => !boundBySlot.has(s));
+  return merged;
+}
+
+function renderOntologyReceipt({ action, result, hostApplied, hostState }) {
+  if (result.code) {
+    // ontology_disabled / ontology_not_declared：内核已给人类可读 message，原样带回。
+    return `[AEC] op=ontology 未执行：${result.message}`;
+  }
+  const lines = [];
+  const bo = result.bo ?? {};
+  if (action === 'get') {
+    const sections = bo.sections ?? {};
+    lines.push(`[AEC] 业务本体 ${bo.bo_id ?? '?'}@${bo.version ?? '?'}${bo.digest ? `（digest ${String(bo.digest).slice(0, 12)}…）` : ''} 声明节视图：`);
+    for (const [name, entries] of Object.entries(sections))
+      lines.push(`  · ${name} ${Array.isArray(entries) ? entries.length : '?'} 项`);
+    if (Array.isArray(bo.declared_paths) && bo.declared_paths.length)
+      lines.push(`  · declared_paths ${bo.declared_paths.length} 条（宿主合并见 host_state）`);
+    if (hostState) {
+      lines.push(`  · 宿主绑定 ${hostState.bindings.length}${hostState.declared_unknown?.length ? `，未绑 ${hostState.declared_unknown.length}` : ''}；宿主事实 ${hostState.host_facts}${hostState.host_facts_stale ? `（stale ${hostState.host_facts_stale}）` : ''}`);
+      for (const b of hostState.bindings) lines.push(`    · ${b.slot} ← ${b.value_ref}（${b.source}）`);
+    }
+    lines.push(result.host_merge_hint ?? '宿主合并：按 declared_paths 读 host_fact/host_binding；旧 digest 的事实标 stale 不参与决策。');
+    lines.push('业务语义变更走 delta（人工确认后 promote），不要直接改已发布 BO。');
+  } else if (action === 'observe') {
+    lines.push(`[AEC] 事实分类完成：accepted ${result.accepted?.length ?? 0}｜unmodeled ${result.unmodeled?.length ?? 0}｜rejected ${result.rejected?.length ?? 0}｜delta ${result.deltas?.length ?? 0}`);
+    lines.push(`  · 宿主写入：facts ${hostApplied.facts}、observations ${hostApplied.observations}、deltas ${hostApplied.deltas}（candidate，人工晋升）`);
+    for (const r of result.rejected ?? []) lines.push(`  · 拒绝 ${r.path}：${r.code}${r.message ? ` — ${r.message}` : ''}`);
+    for (const u of result.unmodeled ?? []) lines.push(`  · unmodeled ${u.path}（进 host_observation，不参与决策；要建模先扩 BO）`);
+    lines.push(result.note ?? '内核只分类；宿主库写入由边端执行。');
+  } else {
+    lines.push(`[AEC] 绑定成功：${result.bound?.slot} ← ${result.bound?.value_ref}（只存引用；明文永不入库）`);
+    lines.push(`  · 宿主写入：bindings ${hostApplied.bindings}`);
+    lines.push(result.note ?? '由边端写 host_binding。');
+  }
+  return lines.join('\n');
 }
 
 // 模型可执行的错误指引（§0.2：模型永远不需要理解内核内部）。
@@ -604,19 +791,33 @@ export function createMcpV2(kernel, { profile = 'run', endpoint = null, credenti
     { instructions: profile === 'author'
       ? '经验包创作。仅当用户明确要求"用 AEC 做一个经验包/技能"时调用。五阶段，内核按门推进：open（八维需求卡 + 资源需求）→ learn（本库检索，可选）→ plan（HTML 一页：三张图 + 资源表 + 判据表，必须打开给用户看并确认）→ draft（A/D 门，登记草稿）→ 试用（沙箱里跑，不是交付）→ publish（四门 + 用户明确许可）。图示一律用内核给的 HTML 文件展示，不要贴 mermaid 源码。回执第一行的阶段横幅就是当前该做什么、不许做什么。宿主本地记忆用 aec_local（op=recall 取上下文 / remember 记候选）。'
       : '经验包下发。仅当用户明确要求"使用/调用 AEC"时调用；其余情况不要调用。op=open 时把用户原话传给 intent。任务前可用 aec_local op=recall 取宿主本地记忆，任务后 op=remember 记候选记忆。' });
-  const handlers = aecEdgeHandlers(kernel);
+  // AEC 5.2：op=ontology 宿主写入通道——getStore 在下方 aec_local 块注入同一懒加载
+  // store（lite/关闭时 null → 边端全部跳过，回执逐字节等价）。
+  const ontologyCtx = { env, getStore: null };
+  const handlers = aecEdgeHandlers(kernel, ontologyCtx);
   server.registerTool('aec', {
     description: profile === 'author'
       ? '试用草稿专用（author 工作流的第 4/5 步）。仅在 aec_author draft 返回 trial_ref 后调用：op=open 带 experience_ref 与 trial_of 跑真实试用，op=close 取得 authoritative 证据。试用产物写在独立沙箱（~/.aec-trials/…），不写用户项目；这是验证，不是给用户实施。不要用它处理普通任务——普通任务用 run profile 的 aec。'
       : '经验包下发。仅当用户明确要求"使用/调用 AEC"时调用；其余情况不要调用。op=open 时把用户原话传给 intent。',
     inputSchema: {
-      op: z.enum(['open', 'resource', 'turn', 'close']).describe('open=开始任务 resource=取材料 turn=失败或提问 close=结束'),
+      op: z.enum(['open', 'resource', 'turn', 'close', 'ontology']).describe('open=开始任务 resource=取材料 turn=失败或提问 close=结束 ontology=业务本体/宿主事实'),
       intent: z.string().optional().describe('op=open 必填：用户原话，不改写、不总结'),
       session: z.string().optional().describe('open 之外必填'),
       workspace: z.string().optional().describe('可选：产物根目录；不传由 aec-mcp 决定。带 trial_of 的试用一律用沙箱，此参数被忽略'),
       stage: z.string().optional(), trigger: z.string().optional(), want: z.string().optional(),
       note: z.string().optional(), ask: z.string().optional(), answer: z.string().optional(),
       status: z.enum(['done', 'abandoned']).optional(),
+      // AEC 5.2（ADR §5.3）：op=ontology 三 action。内核只计算；宿主库写入由本边端执行。
+      action: z.enum(['get', 'observe', 'bind']).optional().describe('op=ontology 必填：get=读 BO 声明节视图（本边端合并宿主事实） observe=上报宿主事实（未知 path 进 unmodeled） bind=绑定槽位（只存引用）'),
+      sections: z.array(z.string()).optional().describe('op=ontology,get 可选：限定 BO 节'),
+      facts: z.array(z.object({
+        path: z.string(), value: z.unknown().optional(), value_ref: z.string().optional(),
+        source: z.string().optional(), observed_at: z.string().optional(),
+        confidence: z.number().min(0).max(1).optional(), valid_until: z.string().optional(),
+      })).optional().describe('op=ontology,observe 必填：事实数组；敏感槽位只收 value_ref'),
+      slot: z.string().optional().describe('op=ontology,bind 必填：BO bindings 槽位'),
+      value_ref: z.string().optional().describe('op=ontology,bind 必填：值引用（敏感槽位需 ref:/host:/env:/vault:/keyring: 前缀）'),
+      source: z.string().optional().describe('op=ontology,bind 可选：user|material|probe|memory|knowledge|run|inference'),
       // a125（§20）：显式声明以便拒绝而非静默剥离——验收不经 close 入参。
       acceptance: z.unknown().optional().describe('禁止：验收结果不经 close 入参，传入即被内核拒绝'),
       // W17（§13.2）：GoalFrame / 假设的结构化修订（turn）。target 指向 session
@@ -783,6 +984,7 @@ export function createMcpV2(kernel, { profile = 'run', endpoint = null, credenti
       getStore,
       close: () => { try { _store?.close(); } catch { /* ignore */ } _store = null; _storeReady = true; },
     };
+    ontologyCtx.getStore = getStore; // AEC 5.2：op=ontology 与 aec_local 共用同一 store
     server.registerTool('aec_local', {
       description: '宿主本地记忆/知识基座（Host MKS，host-mks.sqlite）。op=describe 看已沉淀什么（任务前）| recall 按 critic 高分检索上下文（query 用用户原话）| remember 记候选记忆（任务后，只写 candidate）| list/show/edit/forget 管理 | export 导出 bundle 备份。lite 形态（未满足 Node22+/≥2GB 或显式 lite）返回 host_mks_lite 降级回执。',
       inputSchema: {
