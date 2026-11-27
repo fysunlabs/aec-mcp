@@ -24,6 +24,8 @@ import { renderGuidance } from './guidance-render.mjs';
 import { renderKnowledge } from './knowledge-render.mjs';
 import { renderComposition } from './composition-render.mjs';
 import { createSubjectResolver } from './subject.mjs';
+// 5.2.0 O2-01：内置本地记忆域（单入口完整能力）；store 懒加载见 createMcpV2 尾部
+import { createLocalHandlers, validateLocalOp } from './mks/local-handlers.mjs';
 import { mcpContinuityEnabled, mcpGuidanceEnabled, mcpKnowledgeEnabled, localMemoryMode } from './mks/flags.mjs';
 
 // 模块级惰性状态：仅在 continuity 生效时创建；进程级缓存，不落盘。
@@ -597,11 +599,11 @@ export function errorReceipt(e) {
   return { code, text, pub: { ...pub, code } };
 }
 
-export function createMcpV2(kernel, { profile = 'run', endpoint = null, credentialsFile = null, env = process.env, rolesDb = null } = {}) {
-  const server = new McpServer({ name: 'aec-mcp', version: '2.1.0' },
+export function createMcpV2(kernel, { profile = 'run', endpoint = null, credentialsFile = null, env = process.env, rolesDb = null, rerankFn = undefined, rerankMeta = undefined } = {}) {
+  const server = new McpServer({ name: 'aec-mcp', version: '2.2.0' },
     { instructions: profile === 'author'
-      ? '经验包创作。仅当用户明确要求"用 AEC 做一个经验包/技能"时调用。五阶段，内核按门推进：open（八维需求卡 + 资源需求）→ learn（本库检索，可选）→ plan（HTML 一页：三张图 + 资源表 + 判据表，必须打开给用户看并确认）→ draft（A/D 门，登记草稿）→ 试用（沙箱里跑，不是交付）→ publish（四门 + 用户明确许可）。图示一律用内核给的 HTML 文件展示，不要贴 mermaid 源码。回执第一行的阶段横幅就是当前该做什么、不许做什么。'
-      : '经验包下发。仅当用户明确要求"使用/调用 AEC"时调用；其余情况不要调用。op=open 时把用户原话传给 intent。' });
+      ? '经验包创作。仅当用户明确要求"用 AEC 做一个经验包/技能"时调用。五阶段，内核按门推进：open（八维需求卡 + 资源需求）→ learn（本库检索，可选）→ plan（HTML 一页：三张图 + 资源表 + 判据表，必须打开给用户看并确认）→ draft（A/D 门，登记草稿）→ 试用（沙箱里跑，不是交付）→ publish（四门 + 用户明确许可）。图示一律用内核给的 HTML 文件展示，不要贴 mermaid 源码。回执第一行的阶段横幅就是当前该做什么、不许做什么。宿主本地记忆用 aec_local（op=recall 取上下文 / remember 记候选）。'
+      : '经验包下发。仅当用户明确要求"使用/调用 AEC"时调用；其余情况不要调用。op=open 时把用户原话传给 intent。任务前可用 aec_local op=recall 取宿主本地记忆，任务后 op=remember 记候选记忆。' });
   const handlers = aecEdgeHandlers(kernel);
   server.registerTool('aec', {
     description: profile === 'author'
@@ -755,6 +757,67 @@ export function createMcpV2(kernel, { profile = 'run', endpoint = null, credenti
       }
     });
   }
+
+  // ---- 5.2.0 O2-01：内置本地记忆域（单入口完整能力，owner 决策 2026-11-27）----
+  // 统一工具 aec_local（op 参数化 8 操作），与 --profile local 兼容入口共用
+  // src/mks/local-handlers.mjs（单一实现，防漂移）。store 懒加载：首次调用才
+  // 判定形态/建库（lite / 判定不过 → 结构化降级回执 host_mks_lite，不建库不落盘）；
+  // 建库失败不拖垮任务面。只访问 host-mks.sqlite，绝不触远端 kernel 业务数据。
+  {
+    let _store = null; let _storeReady = false;
+    let _domain = null;
+    const getStore = async () => {
+      if (_storeReady) return _store;
+      _storeReady = true;
+      try {
+        const { detectLocalHostMode } = await import('./mcp-local.mjs');
+        const { HostMksStore, resolveHostMksPath } = await import('./mks/store.mjs');
+        const mode = detectLocalHostMode({ env });
+        if (mode !== 'node' && mode !== 'sovereign') return null;
+        _store = new HostMksStore({ path: resolveHostMksPath({ env }), env: { ...env, AEC_MCP_LOCAL_MEMORY: mode } });
+      } catch { _store = null; }
+      return _store;
+    };
+    const getDomain = (store) => _domain ??= createLocalHandlers(store, { env, rerankFn, rerankMeta });
+    server._hostMks = { // main() 退出时关闭；测试可经它探测懒建库行为
+      getStore,
+      close: () => { try { _store?.close(); } catch { /* ignore */ } _store = null; _storeReady = true; },
+    };
+    server.registerTool('aec_local', {
+      description: '宿主本地记忆/知识基座（Host MKS，host-mks.sqlite）。op=describe 看已沉淀什么（任务前）| recall 按 critic 高分检索上下文（query 用用户原话）| remember 记候选记忆（任务后，只写 candidate）| list/show/edit/forget 管理 | export 导出 bundle 备份。lite 形态（未满足 Node22+/≥2GB 或显式 lite）返回 host_mks_lite 降级回执。',
+      inputSchema: {
+        op: z.enum(['describe', 'recall', 'remember', 'list', 'show', 'edit', 'forget', 'export'])
+          .describe('describe=本地沉淀摘要 recall=检索 remember=记候选 list=列表 show=详情 edit=编辑候选 forget=遗忘 export=导出'),
+        aspect: z.enum(['status', 'ontology', 'experience']).optional().describe('op=describe：摘要侧面'),
+        query: z.string().optional().describe('op=recall 必填：检索意图/原话'),
+        kinds: z.array(z.string()).optional().describe('op=recall：限定 memory kind'),
+        top_k: z.number().int().min(3).max(5).optional().describe('op=recall：注入条数 3–5'),
+        kind: z.string().optional().describe('op=remember：episodic/semantic/procedural/business/reflective/normative；op=list：按 kind 过滤'),
+        summary: z.string().optional().describe('op=remember 必填：记忆要点'),
+        title: z.string().optional().describe('op=remember/edit：标题'),
+        content: z.record(z.unknown()).optional().describe('op=remember：结构化内容'),
+        scope: z.enum(['session', 'project', 'tenant', 'global']).optional().describe('op=remember：作用域'),
+        confidence: z.number().min(0).max(1).optional().describe('op=remember/edit：置信度'),
+        status: z.string().optional().describe('op=list：按 status 过滤'),
+        limit: z.number().int().min(1).max(5000).optional().describe('op=list/export：条数上限'),
+        legacy: z.boolean().optional().describe('op=list：true=列无作用域链接的旧数据（隔离区）'),
+        object_type: z.enum(['memory', 'business_term', 'preference', 'episode', 'chunk', 'claim', 'element']).optional().describe('op=list：对象类型'),
+        memory_id: z.string().optional().describe('op=show/edit/forget 必填：记忆 id'),
+      },
+    }, async args => {
+      const failR = (code, error) => ({ isError: true, content: [{ type: 'text', text: `[aec_local] ${code}: ${error}` }], structuredContent: { code, error } });
+      try {
+        const op = args.op || 'describe';
+        const vErr = validateLocalOp(op, args);
+        if (vErr) return failR(vErr.code, vErr.error);
+        const store = await getStore();
+        const def = getDomain(store)[op];
+        return await def.handler(args);
+      } catch (e) {
+        return failR(e?.code || 'error', e?.message || String(e));
+      }
+    });
+  }
   return server;
 }
 
@@ -805,7 +868,7 @@ export async function main() {
   if (process.env.AEC_STARTUP_PROBE !== '0') await probeEndpoint(validateEndpoint(endpoint));
   const server = createMcpV2(kernel, { profile, endpoint, rolesDb });
   let closing;
-  const close = () => closing ??= (async () => { try { await server.close(); } finally { rolesDb.close(); } })();
+  const close = () => closing ??= (async () => { try { server._hostMks?.close(); } catch { /* ignore */ } try { await server.close(); } finally { rolesDb.close(); } })();
   for (const event of ['end', 'close']) process.stdin.once(event, () => { void close(); });
   await server.connect(new StdioServerTransport());
   if (process.stdin.readableEnded || process.stdin.destroyed) void close();

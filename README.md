@@ -74,6 +74,18 @@ npm link             # ② 再全局链接 aec-mcp 命令
 
 不填 `AEC_KERNEL_URL` 时默认连接 AEC 官方云端。完整带注释的配置样例见 [`config/mcp.example.json`](./config/mcp.example.json)。
 
+**这一个入口就是完整能力**，无需再配其它 AEC MCP：
+
+| 工具 | 能力 |
+|---|---|
+| `aec` | 经验包任务（open/turn/resource/close，云端内核按门推进） |
+| `aec_local` | 宿主本地记忆/知识基座：`describe / recall / remember / list / show / edit / forget / export`（存本机 `host-mks.sqlite`，任务前取上下文、任务后记候选记忆） |
+| `aec_setup` | 首次密钥配置 |
+
+`aec_local` 的形态自动判定：Node 22+ 且 ≥2GB 可用磁盘即启用本地库；不满足自动降级并在启动时提示（设 `AEC_MCP_LOCAL_MEMORY=lite` 可显式关闭本地记忆，此时本地工具返回降级回执、不影响任务）。
+
+> 历史说明：2.1.x 及以前本地记忆是独立的 `aec-mcp --profile local` 入口（需单独配置一条 MCP）。2.2.0 起已并入 `aec` 入口；旧入口仅为兼容保留，新配置一律只用上面这一条。
+
 > **自托管 / 私有部署**：在 `env` 里加 `"AEC_KERNEL_URL": "<你的内核服务地址>"` 即可覆盖默认云端；占位样例值（如 `*.example`）会被启动自检拒绝。
 
 如果你是**创作者**，再加一个创作入口（创作端点仅内网可用，需要运维提供的地址）：

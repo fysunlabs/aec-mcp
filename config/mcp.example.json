@@ -1,5 +1,5 @@
 {
-  "_comment": "aec-mcp MCP Host 配置样例（密钥模式 v2.0）。使用者（run）免配置：默认连接 AEC 官方云端；首次使用时 AI 助手会向用户要一枚 AEC 密钥（aec_key_ 开头，管理员从 AEC 服务器生成）并经 aec_setup 校验保存到本机。也可以用 env AEC_API_KEY 不经对话注入密钥。自托管/私有部署时才需要填 AEC_KERNEL_URL（占位样例值如 *.example 会被启动自检拒绝）。WorkBuddy 5.x(≥5.11) 注意：strict MCP config 默认只加载已信任的 MCP，仅手写本文件会被判为 scope=user blocked by strict MCP config 而不加载，重启客户端无效；必须在「自定义连接器 → 添加 MCP」里添加本条目并点「信任」，再新建/重启会话才生效。",
+  "_comment": "aec-mcp MCP Host 配置样例（密钥模式 v2.0）。使用者（run）免配置：默认连接 AEC 官方云端；首次使用时 AI 助手会向用户要一枚 AEC 密钥（aec_key_ 开头，管理员从 AEC 服务器生成）并经 aec_setup 校验保存到本机。也可以用 env AEC_API_KEY 不经对话注入密钥。自托管/私有部署时才需要填 AEC_KERNEL_URL（占位样例值如 *.example 会被启动自检拒绝）。5.2.0 起本地记忆/知识基座已内置（aec_local 工具，自动判定形态：Node22+ 且 ≥2GB 可用磁盘即启用，AEC_MCP_LOCAL_MEMORY=lite 可显式关闭）——只配这一个入口就有完整能力，无需再配 aec-local。WorkBuddy 5.x(≥5.11) 注意：strict MCP config 默认只加载已信任的 MCP，仅手写本文件会被判为 scope=user blocked by strict MCP config 而不加载，重启客户端无效；必须在「自定义连接器 → 添加 MCP」里添加本条目并点「信任」，再新建/重启会话才生效。",
   "mcpServers": {
     "aec": {
       "type": "stdio",
@@ -41,6 +41,9 @@
     },
     "_dsh-note": {
       "_comment": "DSH 专用：patch loader 求值阶段宿主 env 尚未注入，command 不要用 !!js process.env.DSH_NODE_EXECUTABLE（会 command 缺失、入口激活失败）；用 !!js process.execPath 或写死 node 绝对路径。"
+    },
+    "_aec-local-legacy": {
+      "_comment": "【已废弃，勿新增】5.2.0 起本地记忆面（describe/recall/remember/list/show/edit/forget/export）已并入上面 aec 入口的 aec_local 工具（op 参数化）。旧的 --profile local 独立入口仅为兼容保留；已配置它的宿主可继续用，新配置一律只用 aec 入口。"
     }
   }
 }

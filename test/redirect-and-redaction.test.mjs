@@ -1,6 +1,15 @@
 // Security regression tests: redirect-refusal (token exfiltration defense) and
 // error redaction. These back the link-security requirements in SECURITY.md.
 // 密钥模式（2026-11-19）：身份 = Bearer api_key（env 注入，测试里给假密钥）。
+// 测试隔离（2026-11-27）：resolveApiKey 会回落本机凭证文件（credentialsPath →
+// os.homedir()）；宿主装过 AEC 时真实凭证会让「缺密钥应拒绝」用例真的发网络
+// 请求而超时误报。这里把 homedir 相关 env 指到一次性目录（Windows 上
+// os.homedir() 读 USERPROFILE，不是 HOME）。
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+const _isoDir = mkdtempSync(join(tmpdir(), 'aec-iso-'));
+for (const k of ['USERPROFILE', 'HOME', 'APPDATA', 'XDG_CONFIG_HOME']) process.env[k] = _isoDir;
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';

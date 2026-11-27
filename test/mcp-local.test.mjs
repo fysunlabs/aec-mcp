@@ -14,7 +14,7 @@ const tmp = () => mkdtempSync(join(tmpdir(), 'aec-local-'));
 const envNode = { AEC_MCP_LOCAL_MEMORY: 'node', AEC_MCP_NODE_ID: 'host:local-1' };
 const call = (s, name, args = {}) => s._registeredTools[name].handler(args);
 
-test('工具面隔离：local 含 describe/recall/remember + 5.1 控制面 5 工具；公共 run/author 不含它们', () => {
+test('工具面（5.2.0 O2-01 修订）：local 入口 8 工具；公共 run/author 不含顶级 local 工具名但内置 aec_local', () => {
   const local = createLocalMcp(null);
   assert.deepEqual(Object.keys(local._registeredTools).sort(),
     ['describe', 'recall', 'remember', 'list', 'show', 'edit', 'forget', 'export'].sort());
@@ -23,18 +23,20 @@ test('工具面隔离：local 含 describe/recall/remember + 5.1 控制面 5 工
   for (const profile of ['run', 'author']) {
     const pub = createMcpV2(fakeKernel, { profile });
     const tools = Object.keys(pub._registeredTools);
-    assert.ok(localTools.every(t => !tools.includes(t)), `${profile} 不含任何 local 工具`);
-    assert.ok(tools.includes('aec') && tools.includes('aec_setup'));
+    assert.ok(localTools.every(t => !tools.includes(t)), `${profile} 不含任何顶级 local 工具名（经统一 aec_local 提供）`);
+    assert.ok(tools.includes('aec') && tools.includes('aec_setup') && tools.includes('aec_local'), `${profile} 含 aec/aec_setup/aec_local`);
   }
 });
 
-test('形态判定（O1-06）：显式优先；显式 node 才执行 Node 判定（不满足降级 lite）；未显式默认 lite', () => {
+test('形态判定（O1-06 + 5.2.0 O2-01 修订）：显式优先；node 需过 Node 判定（不满足降级 lite）；未显式自动判定（=显式 node 同判）', () => {
   const ok = { env: {}, probe: () => 3 * 1024 ** 3 };
   assert.equal(detectLocalHostMode({ env: { AEC_MCP_LOCAL_MEMORY: 'sovereign' }, probe: ok.probe }), 'sovereign');
   assert.equal(detectLocalHostMode({ env: { AEC_MCP_LOCAL_MEMORY: 'node' }, probe: ok.probe }), 'node', '显式 node + Node22+/磁盘达标');
-  assert.equal(detectLocalHostMode({ env: { AEC_MCP_LOCAL_MEMORY: 'node' }, probe: () => 0 }), 'lite', '显式 node 但磁盘不足 → 降级 lite（O1-06）');
+  assert.equal(detectLocalHostMode({ env: { AEC_MCP_LOCAL_MEMORY: 'node' }, probe: () => 0 }), 'lite', '显式 node 但磁盘不足 → 降级 lite');
   assert.equal(detectLocalHostMode({ env: { AEC_MCP_LOCAL_MEMORY: 'lite' }, probe: ok.probe }), 'lite');
-  assert.equal(detectLocalHostMode({ env: {} }), 'lite', '5.1 未显式默认 lite（自动判定留给 3.0，另立 ADR）');
+  // 5.2.0：未显式 → 自动判定，与显式 node 同判（运行时 Node22+ 则同 node，否则同 lite）
+  assert.equal(detectLocalHostMode(ok), detectLocalHostMode({ env: { AEC_MCP_LOCAL_MEMORY: 'node' }, probe: ok.probe }), '未显式 = 显式 node 同判');
+  assert.equal(detectLocalHostMode({ env: {}, probe: () => 0 }), 'lite', '自动判定不满足 → lite');
 });
 
 test('lite 降级：store=null 时全部工具都返回 host_mks_lite，不崩溃', async () => {
