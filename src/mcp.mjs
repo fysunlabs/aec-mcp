@@ -862,10 +862,20 @@ export async function main() {
 
   const rolesDb = new RolesDB(resolveRolesDbPath());
   const kernel = createRemoteKernel({ endpoint, profile, rolesDb });
-  // 启动期连通性自检（P1）：占位域名已在 validateEndpoint 拒绝；这里补"域名合法
-  // 但不可达"——任何 HTTP 响应（含 401/404/5xx）即通过，只有连接层失败才退出，
-  // 让宿主 failOnStartupError 的语义真正落地。AEC_STARTUP_PROBE=0 可显式跳过。
-  if (process.env.AEC_STARTUP_PROBE !== '0') await probeEndpoint(validateEndpoint(endpoint));
+  // 启动期连通性自检（P1；2.2.0 修订为降级启动）：占位域名已在 validateEndpoint
+  // 拒绝（配置错误仍 fail fast）；"域名合法但暂不可达"（内核重启窗口 / VPN·tailnet
+  // 断连等**暂态**故障）不再打死 server——2.1.x 的 failOnStartupError 在宿主侧
+  // 表现为 `MCP error -32000: Connection closed`，模型毫无解释且必须重启会话才能
+  // 恢复（2026-11-27 事故：本机 Tailscale offline → aec-author ECONNREFUSED →
+  // Connection closed）。降级启动后 warn 说明原因与恢复路径，调用时 kernel.call
+  // 给 typed 网络错误，网络恢复后**无需重启宿主**。任何 HTTP 响应（含 401/404）
+  // 即通过；AEC_STARTUP_PROBE=0 可显式跳过探测。
+  if (process.env.AEC_STARTUP_PROBE !== '0') {
+    try { await probeEndpoint(validateEndpoint(endpoint)); }
+    catch (e) {
+      warn(`[AEC] 启动自检：内核 ${endpoint} 暂不可达（${e?.code || 'error'}：${e?.cause || e?.message || ''}）。本 server 仍已启动——调用时将收到带指引的网络错误；网络/内核恢复后无需重启宿主即可重试。常见原因：内核服务未运行、VPN/tailnet 断连（如 Tailscale offline）。`);
+    }
+  }
   const server = createMcpV2(kernel, { profile, endpoint, rolesDb });
   let closing;
   const close = () => closing ??= (async () => { try { server._hostMks?.close(); } catch { /* ignore */ } try { await server.close(); } finally { rolesDb.close(); } })();
